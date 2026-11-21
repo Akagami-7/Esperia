@@ -23,3 +23,4 @@ We choose **Rust (2024 edition)** as the primary programming language for Resona
 
 ## Future Reconsideration Conditions
 None for core architecture. Native C ABI bindings (`extern "C"`) will be provided in later phases for third-party plugin hosting (CLAP / VST3).
+

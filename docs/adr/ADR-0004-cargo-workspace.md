@@ -23,3 +23,4 @@ We adopt a **virtual Cargo workspace** (`resolver = "3"`, edition 2024) with `ap
 
 ## Future Reconsideration Conditions
 None. Additional crates (`project-model`, `dsp`, `commands`, `media`) will be added to this workspace as their responsibilities solidify.
+

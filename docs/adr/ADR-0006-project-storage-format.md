@@ -27,3 +27,4 @@ We adopt a **self-contained directory bundle format** (`MySong.resonance/`):
 
 ## Future Reconsideration Conditions
 Optional binary chunk packing (e.g. MessagePack or CBOR) for ultra-dense automation curves if JSON parsing becomes a bottleneck on multi-gigabyte project manifests.
+

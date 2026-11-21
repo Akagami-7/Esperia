@@ -23,3 +23,4 @@ We choose **`cpal`** encapsulated entirely within the dedicated `crates/audio-io
 
 ## Future Reconsideration Conditions
 If hardware performance or exclusive low-latency routing requires specialized features not exposed by CPAL (such as direct JACK transport sync or ASIO direct channel routing), `audio-io` will implement an internal pluggable driver backend architecture.
+

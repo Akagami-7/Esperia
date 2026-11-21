@@ -39,3 +39,4 @@ This roadmap documents our transition from empty repository to a full production
 - [ ] Mixer console with volume faders, constant-power panning, mute, and solo.
 - [ ] Peak and RMS metering telemetry.
 - [ ] Offline faster-than-realtime WAV export.
+

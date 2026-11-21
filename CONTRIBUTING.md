@@ -29,3 +29,4 @@ Thank you for contributing to Project Resonance! Please review these guidelines 
    fix(audio-engine): prevent zipper noise during pan change
    ```
 4. Submit a Pull Request targeting `main`.
+

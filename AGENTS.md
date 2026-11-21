@@ -29,3 +29,4 @@
 - Do not modify unrelated modules.
 - Explain architectural implications before major changes.
 - Run relevant tests (`cargo test --workspace`) before proposing a merge.
+

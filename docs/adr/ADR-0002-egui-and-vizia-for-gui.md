@@ -23,3 +23,4 @@ We adopt **`eframe` / `egui`** for the core application shell and immediate deve
 
 ## Future Reconsideration Conditions
 If immediate-mode rendering reaches CPU bounds on extremely large arrangements (e.g. 500+ tracks), retained-mode rendering via Vizia will take over the primary timeline canvas.
+

@@ -25,3 +25,4 @@ We enforce **strict real-time audio thread isolation**:
 
 ## Future Reconsideration Conditions
 None. This is a non-negotiable core invariant of Resonance.
+
