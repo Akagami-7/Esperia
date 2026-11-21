@@ -52,11 +52,12 @@ cargo clippy --workspace --all-targets
 cargo run -p resonance-desktop
 ```
 
-## Licensing
+## License
 
-Dual-licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+Licensed under either of:
+
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+* MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
 
