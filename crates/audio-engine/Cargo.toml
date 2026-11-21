@@ -1,0 +1,7 @@
+[package]
+name = "resonance-audio-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+resonance-audio-io = { version = "0.1.0", path = "../audio-io" }

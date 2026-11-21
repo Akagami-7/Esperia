@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/desktop",
+    "crates/audio-engine",
+    "crates/audio-io",
+]
+
