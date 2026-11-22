@@ -37,8 +37,9 @@ Esperia is structured as a modular Rust workspace:
 ```mermaid
 graph TD
     HardwareDevice["Audio Interface / Soundcard"] <-->|CPAL Stream| AudioIO["crates/audio-io"]
-    AudioIO <-->|Lock-free Ringbuffer| AudioEngine["crates/audio-engine"]
-    AudioEngine <-->|Command Queue / State Sync| DesktopApp["apps/desktop"]
+    DesktopApp["apps/desktop"] <-->|Device Selection & Stream Setup| AudioIO
+    DesktopApp <-->|Command Queue / State Sync| AudioEngine["crates/audio-engine"]
+    AudioIO <-->|Audio Buffers| AudioEngine
     FileSystem["Local Filesystem"] <-->|Project JSON & WAV Assets| DesktopApp
 ```
 

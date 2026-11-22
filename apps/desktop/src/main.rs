@@ -3,7 +3,6 @@ use esperia_audio_engine::{AudioEngine, EngineControl};
 use esperia_audio_io::{AudioDeviceInfo, AudioDeviceManager, cpal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use vizia as _;
 
 struct EsperiaApp {
     device_manager: Option<AudioDeviceManager>,
@@ -15,6 +14,8 @@ struct EsperiaApp {
     stream_active: Arc<AtomicBool>,
     _audio_stream: Option<cpal::Stream>,
     status_message: String,
+    active_sample_rate: u32,
+    active_channels: u16,
 }
 
 impl EsperiaApp {
@@ -23,65 +24,88 @@ impl EsperiaApp {
         let _ = tracing_subscriber::fmt().try_init();
         tracing::info!("Initializing Project Esperia Desktop Application");
 
-        let (mut engine, control) = AudioEngine::new(48000.0);
         let stream_active = Arc::new(AtomicBool::new(false));
 
-        let mut output_devices = Vec::new();
-        let mut selected_name = String::new();
-        let mut active_stream = None;
-        let status;
-
-        let device_manager = match AudioDeviceManager::new() {
-            Ok(mgr) => {
-                if let Ok(devs) = mgr.enumerate_output_devices() {
-                    output_devices = devs;
-                    if let Some(default_dev) = output_devices.iter().find(|d| d.is_default_output) {
-                        selected_name = default_dev.name.clone();
-                    } else if let Some(first) = output_devices.first() {
-                        selected_name = first.name.clone();
-                    }
-                }
-
-                // Attempt to start output stream on default device
-                match mgr.default_output_device() {
-                    Ok(dev) => {
-                        let stream_flag = stream_active.clone();
-                        match mgr.build_output_stream(&dev, 48000, 2, move |data: &mut [f32]| {
-                            engine.process(data);
-                        }) {
-                            Ok(stream) => {
-                                active_stream = Some(stream);
-                                stream_flag.store(true, Ordering::Release);
-                                status = "Audio output stream active (48 kHz Stereo)".to_string();
-                            }
-                            Err(e) => {
-                                status = format!("Could not start audio stream: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        status = format!("No default audio device: {e}");
-                    }
-                }
-
-                Some(mgr)
-            }
+        // --- Try to bring up the audio subsystem ---
+        let mgr = match AudioDeviceManager::new() {
+            Ok(m) => m,
             Err(e) => {
-                status = format!("Failed to initialize audio subsystem: {e}");
-                None
+                let (_eng, ctrl) = AudioEngine::new(48000.0, 2);
+                return Self {
+                    device_manager: None,
+                    output_devices: Vec::new(),
+                    selected_device_name: String::new(),
+                    engine_control: ctrl,
+                    frequency: 440.0,
+                    amplitude: 0.1,
+                    stream_active,
+                    _audio_stream: None,
+                    status_message: format!("Failed to initialize audio subsystem: {e}"),
+                    active_sample_rate: 48000,
+                    active_channels: 2,
+                };
             }
         };
 
+        // Enumerate output devices for the UI list
+        let output_devices = mgr.enumerate_output_devices().unwrap_or_default();
+        let selected_device_name = output_devices
+            .iter()
+            .find(|d| d.is_default_output)
+            .or_else(|| output_devices.first())
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+
+        // Query actual hardware config from the default output device
+        let (sample_rate, channels, dev_result) = match mgr.default_output_device() {
+            Ok(dev) => {
+                let (sr, ch) = AudioDeviceManager::default_output_config_params(&dev);
+                (sr, ch, Some(dev))
+            }
+            Err(_) => (48000, 2, None),
+        };
+
+        // Build the engine using the real device config
+        let (mut engine, control) = AudioEngine::new(sample_rate as f32, channels);
+
+        // Build the audio output stream
+        let (active_stream, status_message) = match dev_result {
+            Some(dev) => {
+                let stream_flag = stream_active.clone();
+                match mgr.build_output_stream(
+                    &dev,
+                    sample_rate,
+                    channels,
+                    move |data: &mut [f32]| {
+                        engine.process(data);
+                    },
+                ) {
+                    Ok(stream) => {
+                        stream_flag.store(true, Ordering::Release);
+                        let status = format!(
+                            "Audio output stream active ({} Hz, {} ch)",
+                            sample_rate, channels
+                        );
+                        (Some(stream), status)
+                    }
+                    Err(e) => (None, format!("Could not start audio stream: {e}")),
+                }
+            }
+            None => (None, "No default audio device found".to_string()),
+        };
+
         Self {
-            device_manager,
+            device_manager: Some(mgr),
             output_devices,
-            selected_device_name: selected_name,
+            selected_device_name,
             engine_control: control,
             frequency: 440.0,
             amplitude: 0.1,
             stream_active,
             _audio_stream: active_stream,
-            status_message: status,
+            status_message,
+            active_sample_rate: sample_rate,
+            active_channels: channels,
         }
     }
 }
@@ -213,7 +237,10 @@ impl eframe::App for EsperiaApp {
         // Audio Hardware Devices Box
         ui.group(|ui| {
             ui.heading("Audio Hardware Devices (CPAL CoreAudio / WASAPI / ALSA)");
-            ui.label("Discovered physical audio output endpoints on this workstation:");
+            ui.label(format!(
+                "Active stream: {} Hz, {} ch — Discovered output endpoints:",
+                self.active_sample_rate, self.active_channels
+            ));
             ui.add_space(6.0);
 
             if self.output_devices.is_empty() {
@@ -245,16 +272,6 @@ impl eframe::App for EsperiaApp {
                     });
                 }
             }
-        });
-
-        ui.add_space(16.0);
-
-        // GUI Framework Note (egui & vizia)
-        ui.group(|ui| {
-            ui.heading("GUI Architecture Note");
-            ui.label(
-                "Esperia integrates egui/eframe for immediate-mode workspace rendering, and retains vizia for audio widget and plugin UI interoperability.",
-            );
         });
 
         ui.add_space(16.0);

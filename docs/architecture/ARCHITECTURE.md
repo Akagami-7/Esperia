@@ -87,9 +87,9 @@ Esperia/
 ```
 
 ### Module Dependency Rules:
-1. `apps/desktop` depends on `crates/audio-engine` and `crates/audio-io`.
-2. `crates/audio-engine` depends on `crates/audio-io`.
-3. `crates/audio-io` has zero knowledge of `audio-engine` or `desktop`.
+1. `apps/desktop` coordinates both `crates/audio-engine` and `crates/audio-io`.
+2. `crates/audio-engine` contains pure DSP and synthesis logic and has ZERO dependencies on `audio-io`, CPAL, or GUI.
+3. `crates/audio-io` provides hardware abstraction and has ZERO dependencies on `audio-engine` or `desktop`.
 4. The real-time audio callback in `audio-engine` NEVER references GUI state directly.
 
 ---
