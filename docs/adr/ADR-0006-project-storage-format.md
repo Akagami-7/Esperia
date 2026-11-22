@@ -15,7 +15,7 @@ Many legacy DAWs use opaque binary file formats or absolute filesystem paths to 
 3. **Directory Bundle with JSON Manifest & Audio Pool:** A directory structure containing a human-readable, schema-versioned JSON/MessagePack manifest (`project.json`), a local `audio/` pool, and disposable waveform `cache/` directories.
 
 ## Chosen Decision
-We adopt a **self-contained directory bundle format** (`MySong.resonance/`):
+We adopt a **self-contained directory bundle format** (`MySong.esperia/`):
 - `project.json`: Clean, versioned manifest describing tracks, clips, and mixer states.
 - `audio/`: Copied or referenced local audio files.
 - `cache/`: Disposable waveform peak overviews (never required to open or reconstruct the project).

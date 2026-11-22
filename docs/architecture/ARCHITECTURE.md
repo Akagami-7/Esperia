@@ -1,14 +1,14 @@
-# System Architecture Document — Resonance
+# System Architecture Document — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Architecture  
-**Author:** Resonance Core Team  
+**Author:** Esperia Core Team  
 
 ---
 
 ## 1. High-Level Architectural Overview
 
-Resonance is designed around the core principle of **strict thread isolation and deterministic lock-free data flow**. The system is partitioned into independent domains separated by bounded, lock-free communication channels.
+Esperia is designed around the core principle of **strict thread isolation and deterministic lock-free data flow**. The system is partitioned into independent domains separated by bounded, lock-free communication channels.
 
 ```mermaid
 flowchart TB
@@ -62,7 +62,7 @@ The repository is organized as a Cargo workspace with explicit dependency bounda
 Esperia/
 ├── Cargo.toml                     # Root workspace manifest (resolver = "3")
 ├── apps/
-│   └── desktop/                   # Resonance desktop binary (GUI, menus, interactions)
+│   └── desktop/                   # Esperia desktop binary (GUI, menus, interactions)
 │       ├── Cargo.toml
 │       └── src/
 │           ├── main.rs            # Application entrypoint
@@ -96,7 +96,7 @@ Esperia/
 
 ## 3. Concurrency & Thread Isolation Model
 
-Resonance enforces strict separation between four distinct execution threads:
+Esperia enforces strict separation between four distinct execution threads:
 
 | Thread Name | Priority | Responsibilities | Constraints |
 | :--- | :--- | :--- | :--- |
@@ -166,7 +166,7 @@ flowchart LR
 
 Projects reside in self-contained directory bundles:
 ```
-MySong.resonance/
+MySong.esperia/
 ├── project.json            # Human-readable project manifest
 ├── audio/                  # Audio pool (WAV files, imported assets)
 │   ├── take_01.wav

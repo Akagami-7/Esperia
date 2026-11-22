@@ -1,4 +1,4 @@
-# Resonance Engineering Roadmap
+# Esperia Engineering Roadmap
 
 This roadmap documents our transition from empty repository to a full production DAW.
 
@@ -21,9 +21,9 @@ This roadmap documents our transition from empty repository to a full production
 - [x] Clean zero-warning verification across `cargo check`, `cargo fmt`, `cargo clippy`, and `cargo test`.
 
 ## Stage 3 — First Working DAW
-- [x] Native window management and developer preview shell in `resonance-desktop`.
-- [x] Audio device enumeration subsystem in `resonance-audio-io` (hosts, inputs, outputs, default devices, sample rates).
-- [x] Sine-wave test tone generator in `resonance-audio-engine` (440 Hz, real-time safe callback, play/stop, frequency control).
+- [x] Native window management and developer preview shell in `esperia-desktop`.
+- [x] Audio device enumeration subsystem in `esperia-audio-io` (hosts, inputs, outputs, default devices, sample rates).
+- [x] Sine-wave test tone generator in `esperia-audio-engine` (440 Hz, real-time safe callback, play/stop, frequency control).
 - [ ] Multi-threaded audio playback through CPAL without blocking UI.
 - [ ] Symphonia WAV file decoding & streaming.
 - [ ] Project persistence (manifest save/reopen).
@@ -39,4 +39,3 @@ This roadmap documents our transition from empty repository to a full production
 - [ ] Mixer console with volume faders, constant-power panning, mute, and solo.
 - [ ] Peak and RMS metering telemetry.
 - [ ] Offline faster-than-realtime WAV export.
-

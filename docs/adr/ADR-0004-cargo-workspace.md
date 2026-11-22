@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-Resonance consists of multiple decoupled subsystems: a desktop GUI application, a real-time DSP audio engine, a hardware I/O driver layer, and future modules such as project serialization, audio decoding, and command history.
+Esperia consists of multiple decoupled subsystems: a desktop GUI application, a real-time DSP audio engine, a hardware I/O driver layer, and future modules such as project serialization, audio decoding, and command history.
 
 ## Problem
 A monolithic single-crate architecture encourages tight coupling between the user interface, real-time audio callback internals, and hardware drivers. A mistake in the GUI could easily introduce blocking calls or memory allocations into the audio processing loop.

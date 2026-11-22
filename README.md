@@ -1,15 +1,15 @@
-# Project Resonance
+# Project Esperia
 
-> **Resonance** is a modern, modular, local-first Digital Audio Workstation (DAW) built in Rust for macOS, Windows, and Linux.
+> **Esperia** is a modern, modular, local-first Digital Audio Workstation (DAW) built in Rust for macOS, Windows, and Linux.
 
 ---
 
 ## Architecture Overview
 
-Resonance enforces strict thread isolation and lock-free concurrency between the user interface and the real-time audio pipeline:
+Esperia enforces strict thread isolation and lock-free concurrency between the user interface and the real-time audio pipeline:
 
 ```
-Esperia / resonance-daw/
+Esperia/
 ├── apps/
 │   └── desktop/            # Native desktop GUI (eframe/egui & vizia)
 ├── crates/
@@ -49,7 +49,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets
 
 # Run the desktop application
-cargo run -p resonance-desktop
+cargo run -p esperia-desktop
 ```
 
 ## License
@@ -60,4 +60,3 @@ Licensed under either of:
 * MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
-

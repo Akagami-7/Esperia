@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-Resonance requires reliable, low-latency audio device enumeration, stream initialization, and audio buffer callbacks across macOS, Windows, and Linux.
+Esperia requires reliable, low-latency audio device enumeration, stream initialization, and audio buffer callbacks across macOS, Windows, and Linux.
 
 ## Problem
 Each operating system provides radically different native audio APIs: CoreAudio on macOS, WASAPI / ASIO on Windows, and ALSA / PulseAudio / PipeWire / JACK on Linux. Writing and maintaining bespoke driver wrappers for all five interfaces directly inside the engine would introduce massive maintenance burden and platform fragmentation.

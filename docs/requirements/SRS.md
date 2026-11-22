@@ -1,4 +1,4 @@
-# Software Requirements Specification (SRS) — Resonance
+# Software Requirements Specification (SRS) — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Specification  
@@ -9,10 +9,10 @@
 ## 1. Introduction
 
 ### 1.1 Purpose
-This document provides complete, verifiable functional and non-functional requirements for the **Resonance** Digital Audio Workstation. It guides implementation, verification, and automated testing across all workspace crates.
+This document provides complete, verifiable functional and non-functional requirements for the **Esperia** Digital Audio Workstation. It guides implementation, verification, and automated testing across all workspace crates.
 
 ### 1.2 Scope
-Resonance is a desktop software application for multi-track audio recording, editing, mixing, and offline rendering on macOS, Windows, and Linux.
+Esperia is a desktop software application for multi-track audio recording, editing, mixing, and offline rendering on macOS, Windows, and Linux.
 
 ### 1.3 Definitions and Acronyms
 - **AudioSource:** A decoded or memory-mapped audio asset (e.g. PCM WAV file) resident on disk or in the asset cache.
@@ -28,7 +28,7 @@ Resonance is a desktop software application for multi-track audio recording, edi
 ## 2. Overall Description
 
 ### 2.1 Product Perspective
-Resonance is structured as a modular Rust workspace:
+Esperia is structured as a modular Rust workspace:
 - `apps/desktop`: Native GUI frontend presenting the arrangement, timeline, mixer, and controls.
 - `crates/audio-engine`: Real-time audio graph, track summing, clip scheduling, and lock-free message handling.
 - `crates/audio-io`: Hardware interface layer wrapping CPAL streams and sample format conversions.
@@ -50,8 +50,8 @@ graph TD
 | ID | Requirement Statement | Priority | Verification Method |
 | :--- | :--- | :--- | :--- |
 | **FR-PRJ-001** | The application shall allow the user to create a new, empty project with configurable sample rate (44.1 kHz, 48 kHz, 96 kHz) and tempo (20 - 300 BPM). | High | Integration Test |
-| **FR-PRJ-002** | The application shall serialize the entire project state (tracks, clips, mixer settings, timeline markers) into a human-readable JSON project file (`project.resonance`). | High | Unit & Persistence Test |
-| **FR-PRJ-003** | The application shall open previously saved `.resonance` projects and restore state with sample-accurate fidelity. | High | Persistence Test |
+| **FR-PRJ-002** | The application shall serialize the entire project state (tracks, clips, mixer settings, timeline markers) into a human-readable JSON project file (`project.esperia`). | High | Unit & Persistence Test |
+| **FR-PRJ-003** | The application shall open previously saved `.esperia` projects and restore state with sample-accurate fidelity. | High | Persistence Test |
 | **FR-PRJ-004** | The application shall perform atomic saves using a write-to-temporary-file and rename pattern to prevent corruption on crash or power failure. | High | Automated Fault Test |
 | **FR-PRJ-005** | The application shall prompt to save unsaved changes before exiting or creating a new project. | Medium | Manual UI Test |
 

@@ -1,4 +1,4 @@
-# Project Resonance — Engineering Guidelines
+# Project Esperia — Engineering Guidelines
 
 ## General
 - Primary language: Rust.

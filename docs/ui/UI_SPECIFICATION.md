@@ -1,4 +1,4 @@
-# UI/UX Specification — Resonance
+# UI/UX Specification — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Specification  
@@ -8,7 +8,7 @@
 
 ## 1. Design System & Aesthetics
 
-Resonance adheres to a **hardware-inspired, high-contrast dark studio aesthetic**. The interface is engineered for prolonged sessions in low-light studio environments, prioritizing legibility, clear spatial hierarchy, and zero visual clutter.
+Esperia adheres to a **hardware-inspired, high-contrast dark studio aesthetic**. The interface is engineered for prolonged sessions in low-light studio environments, prioritizing legibility, clear spatial hierarchy, and zero visual clutter.
 
 ### 1.1 Color Palette
 - **Background Deep (`#121316`):** Root window background and canvas void.

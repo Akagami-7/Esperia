@@ -1,6 +1,6 @@
-# Contributing to Resonance
+# Contributing to Esperia
 
-Thank you for contributing to Project Resonance! Please review these guidelines before submitting a pull request.
+Thank you for contributing to Project Esperia! Please review these guidelines before submitting a pull request.
 
 ---
 

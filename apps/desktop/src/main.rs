@@ -1,11 +1,11 @@
 use eframe::egui;
-use resonance_audio_engine::io::{AudioDeviceInfo, AudioDeviceManager, cpal};
-use resonance_audio_engine::{AudioEngine, EngineControl};
+use esperia_audio_engine::io::{AudioDeviceInfo, AudioDeviceManager, cpal};
+use esperia_audio_engine::{AudioEngine, EngineControl};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vizia as _;
 
-struct ResonanceApp {
+struct EsperiaApp {
     device_manager: Option<AudioDeviceManager>,
     output_devices: Vec<AudioDeviceInfo>,
     selected_device_name: String,
@@ -17,11 +17,11 @@ struct ResonanceApp {
     status_message: String,
 }
 
-impl ResonanceApp {
+impl EsperiaApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Initialize logging
         let _ = tracing_subscriber::fmt().try_init();
-        tracing::info!("Initializing Project Resonance Desktop Application");
+        tracing::info!("Initializing Project Esperia Desktop Application");
 
         let (mut engine, control) = AudioEngine::new(48000.0);
         let stream_active = Arc::new(AtomicBool::new(false));
@@ -86,7 +86,7 @@ impl ResonanceApp {
     }
 }
 
-impl eframe::App for ResonanceApp {
+impl eframe::App for EsperiaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.engine_control.is_playing() {
             ui.ctx().request_repaint();
@@ -94,7 +94,7 @@ impl eframe::App for ResonanceApp {
 
         // Header Panel
         ui.horizontal(|ui| {
-            ui.heading("Project Resonance");
+            ui.heading("Project Esperia");
             ui.label("•");
             ui.label("Developer Preview (Stage 2/3)");
             ui.separator();
@@ -253,7 +253,7 @@ impl eframe::App for ResonanceApp {
         ui.group(|ui| {
             ui.heading("GUI Architecture Note");
             ui.label(
-                "Resonance integrates egui/eframe for immediate-mode workspace rendering, and retains vizia for audio widget and plugin UI interoperability.",
+                "Esperia integrates egui/eframe for immediate-mode workspace rendering, and retains vizia for audio widget and plugin UI interoperability.",
             );
         });
 
@@ -273,13 +273,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 720.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("Resonance — Audio Workstation"),
+            .with_title("Esperia — Audio Workstation"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Resonance",
+        "Esperia",
         options,
-        Box::new(|cc| Ok(Box::new(ResonanceApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(EsperiaApp::new(cc)))),
     )
 }

@@ -1,17 +1,17 @@
-# Product Requirements Document (PRD) — Resonance
+# Product Requirements Document (PRD) — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Specification  
-**Product Name:** Resonance  
+**Product Name:** Esperia  
 **Target Milestone:** v0.1.0 MVP → v1.0.0 Production  
 
 ---
 
 ## 1. Executive Summary & Product Vision
 
-**Resonance** is a modern, modular, local-first Digital Audio Workstation (DAW) built in Rust. It delivers uncompromising audio reliability, sub-millisecond determinism, and an elegant, hardware-inspired desktop user experience across macOS, Windows, and Linux.
+**Esperia** is a modern, modular, local-first Digital Audio Workstation (DAW) built in Rust. It delivers uncompromising audio reliability, sub-millisecond determinism, and an elegant, hardware-inspired desktop user experience across macOS, Windows, and Linux.
 
-Commercial DAWs have evolved over decades into monolithic, bloated suites encumbered by proprietary licensing dongles, mandatory cloud telemetry, sluggish web-wrapper frontends, and brittle audio thread boundaries. Resonance exists to reset these conventions:
+Commercial DAWs have evolved over decades into monolithic, bloated suites encumbered by proprietary licensing dongles, mandatory cloud telemetry, sluggish web-wrapper frontends, and brittle audio thread boundaries. Esperia exists to reset these conventions:
 - **Rock-solid stability:** The real-time audio thread never allocates, never blocks, and never crashes due to UI or background tasks.
 - **Native performance:** Built on Rust and modern native graphics rendering, achieving a constant 60+ FPS UI alongside low-latency audio capture and playback.
 - **Local-first & private:** Projects are self-contained folders with transparent, human-readable metadata, standard lossless audio formats, and zero unsolicited network telemetry.
@@ -24,7 +24,7 @@ Commercial DAWs have evolved over decades into monolithic, bloated suites encumb
 1. **Audio Integrity is Sacred:** An audio glitch, dropout, or unexpected clip is an engineering defect. The audio callback is isolated with zero memory allocations, zero locks, and deterministic scheduling.
 2. **Local-First & Sovereign:** The user owns their data. A project created today must open 20 years from now without checking an authentication server or cloud license manager.
 3. **Ergonomic Speed:** Every frequent producer action (slicing, looping, soloing, zooming, automation) must be accessible via direct keyboard shortcuts and immediate visual feedback.
-4. **Transparent Modularity:** Clean separation between presentation (`resonance-desktop`), core processing (`resonance-audio-engine`), and hardware integration (`resonance-audio-io`).
+4. **Transparent Modularity:** Clean separation between presentation (`esperia-desktop`), core processing (`esperia-audio-engine`), and hardware integration (`esperia-audio-io`).
 
 ---
 
@@ -109,8 +109,8 @@ flowchart LR
 ## 6. Non-Goals (Explicitly Out of Scope)
 
 To maintain sharp focus and rapid execution, the following capabilities are **explicitly postponed** or rejected:
-1. **Cloud Sync & Collaboration Server:** Resonance will remain 100% local-first. Cloud backup can be handled by standard file tools (Git, Syncthing, Dropbox).
-2. **Proprietary DRM or Activation Keyrings:** Resonance will never require online phone-home activation.
+1. **Cloud Sync & Collaboration Server:** Esperia will remain 100% local-first. Cloud backup can be handled by standard file tools (Git, Syncthing, Dropbox).
+2. **Proprietary DRM or Activation Keyrings:** Esperia will never require online phone-home activation.
 3. **Video Editing Suite:** While video sync/SMPTE playback will be considered in future for scoring, video compositing will not be developed.
 4. **Integrated Social Media Distribution:** No direct-to-streaming uploaders or social media integrations inside the DAW.
 5. **Score Notation / Engraving:** Dedicated notation typesetting is deferred to specialized notation tools (MusicXML export will be favored).
@@ -124,5 +124,5 @@ To maintain sharp focus and rapid execution, the following capabilities are **ex
 | **M1: Audio Scaffold** | `crates/audio-io` & `crates/audio-engine` | Reliable playback through CPAL on macOS (CoreAudio), Linux (ALSA/Pulse), Windows (WASAPI) with zero panics. |
 | **M2: UI & Timeline Shell** | `apps/desktop` | 60 FPS viewport rendering, responsive track zooming, playhead tracking, zero latency interference with audio thread. |
 | **M3: End-to-End Playback** | Multitrack Engine Integration | Playback of at least 32 simultaneous 44.1kHz/24-bit stereo audio tracks with fader and pan changes under 25% CPU on modern hardware. |
-| **M4: Project Persistence** | Serialization & Reload | Saving project creates a clean directory containing `.resonance` project JSON and audio pool; reloads bit-identically. |
+| **M4: Project Persistence** | Serialization & Reload | Saving project creates a clean directory containing `.esperia` project JSON and audio pool; reloads bit-identically. |
 | **M5: Offline Bounce** | Master Exporter | Rendered WAV matches real-time playback sum within 32-bit floating point precision limits. |

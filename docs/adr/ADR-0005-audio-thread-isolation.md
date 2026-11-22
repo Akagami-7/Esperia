@@ -24,5 +24,5 @@ We enforce **strict real-time audio thread isolation**:
 - **Negative:** Requires disciplined software design: all scratch memory must be pre-allocated, and state synchronization must be modeled through non-blocking command queues.
 
 ## Future Reconsideration Conditions
-None. This is a non-negotiable core invariant of Resonance.
+None. This is a non-negotiable core invariant of Esperia.
 

@@ -1,4 +1,4 @@
-# Testing & Development Strategy — Resonance
+# Testing & Development Strategy — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Specification  
@@ -8,7 +8,7 @@
 
 ## 1. Quality Assurance Philosophy
 
-Resonance is a real-time multimedia workstation. A software failure does not simply manifest as an error dialog—it can produce high-amplitude audio pops that damage hearing or studio monitors, or drop takes during irreplaceable recording sessions.
+Esperia is a real-time multimedia workstation. A software failure does not simply manifest as an error dialog—it can produce high-amplitude audio pops that damage hearing or studio monitors, or drop takes during irreplaceable recording sessions.
 
 Our testing strategy follows a rigorous multi-tiered pyramid:
 1. **Deterministic Unit Testing:** Fast, pure DSP math, timebase calculations, and project serialization tests.
@@ -38,7 +38,7 @@ Our testing strategy follows a rigorous multi-tiered pyramid:
 - **Requirements:**
   - Test constant-power panning at $-1.0$, $0.0$, and $+1.0$.
   - Test parameter interpolation curves across block transitions.
-  - Verify JSON serialization and deserialization of `.resonance` files.
+  - Verify JSON serialization and deserialization of `.esperia` files.
   - Test atomic SPSC ring buffer push, pop, wrapping, and overflow behaviors.
 
 ### 2.2 Property-Based & Fuzz Testing (`proptest`)

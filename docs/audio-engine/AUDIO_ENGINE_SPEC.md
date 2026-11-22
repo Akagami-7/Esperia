@@ -1,4 +1,4 @@
-# Audio Engine Specification — Resonance
+# Audio Engine Specification — Esperia
 
 **Document Version:** 1.0.0  
 **Status:** Approved / Active Specification  
