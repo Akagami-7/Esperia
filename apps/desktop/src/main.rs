@@ -1,6 +1,6 @@
 use eframe::egui;
-use esperia_audio_engine::io::{AudioDeviceInfo, AudioDeviceManager, cpal};
 use esperia_audio_engine::{AudioEngine, EngineControl};
+use esperia_audio_io::{AudioDeviceInfo, AudioDeviceManager, cpal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vizia as _;

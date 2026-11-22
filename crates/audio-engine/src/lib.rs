@@ -2,8 +2,6 @@ use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-pub use esperia_audio_io as io;
-
 /// A mathematically continuous, real-time-safe sine wave generator.
 #[derive(Debug, Clone)]
 pub struct SineGenerator {

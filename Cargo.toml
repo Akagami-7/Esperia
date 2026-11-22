@@ -1,8 +1,10 @@
 [workspace]
-resolver = "3"
 members = [
     "apps/desktop",
-    "crates/audio-engine",
     "crates/audio-io",
+    "crates/audio-engine",
 ]
-
+default-members = [
+    "apps/desktop",
+]
+resolver = "3"
