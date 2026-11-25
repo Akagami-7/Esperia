@@ -1082,7 +1082,6 @@ name = "esperia-audio-io"
 version = "0.1.0"
 dependencies = [
  "cpal",
- "tracing",
 ]
 
 [[package]]
