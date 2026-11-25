@@ -2089,6 +2089,7 @@ impl EsperiaApp {
         let mut new_midi_region_req: Option<(u64, u64)> = None;
         let mut midi_schedule_dirty = false;
         let mut midi_track_toggles: Vec<(u64, bool, bool, bool)> = Vec::new(); // (id, mute, solo, arm)
+        let mut midi_track_gains: Vec<(u64, f32)> = Vec::new();
 
         scroll_area.show(ui, |ui| {
             let sr = self.active_sample_rate.max(1) as f64;
@@ -2454,19 +2455,19 @@ impl EsperiaApp {
                         });
                         ui.horizontal(|ui| {
                             let mute_btn = egui::Button::new("M").fill(if mtrack.muted {
-                                egui::Color32::from_rgb(200, 70, 70)
+                                egui::Color32::from_rgb(45, 130, 225)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             let solo_btn = egui::Button::new("S").fill(if mtrack.soloed {
                                 egui::Color32::from_rgb(210, 175, 50)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             let arm_btn = egui::Button::new("R").fill(if mtrack.record_armed {
                                 egui::Color32::from_rgb(200, 45, 45)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             let m_click = ui.add(mute_btn).clicked();
                             let s_click = ui.add(solo_btn).clicked();
@@ -2474,7 +2475,14 @@ impl EsperiaApp {
                             if m_click || s_click || r_click {
                                 midi_track_toggles.push((mtrack.id, m_click, s_click, r_click));
                             }
-                            ui.weak(mtrack.instrument.display_name());
+                            let mut gain = mtrack.gain_db;
+                            if ui
+                                .add(egui::Slider::new(&mut gain, -60.0..=6.0).show_value(false))
+                                .on_hover_text(format!("{gain:.1} dB ({})", mtrack.instrument.display_name()))
+                                .changed()
+                            {
+                                midi_track_gains.push((mtrack.id, gain));
+                            }
                         });
                     });
                 });
@@ -2750,7 +2758,7 @@ impl EsperiaApp {
             self.rebuild_schedule();
         }
 
-        if !midi_track_toggles.is_empty() {
+        if !midi_track_toggles.is_empty() || !midi_track_gains.is_empty() {
             let proj = self.project_session.project_mut();
             for (tid, m, s, r) in midi_track_toggles {
                 if let Some(t) = proj.midi_tracks.iter_mut().find(|t| t.id == tid) {
@@ -2763,6 +2771,11 @@ impl EsperiaApp {
                     if r {
                         t.record_armed = !t.record_armed;
                     }
+                }
+            }
+            for (tid, g) in midi_track_gains {
+                if let Some(t) = proj.midi_tracks.iter_mut().find(|t| t.id == tid) {
+                    t.gain_db = g;
                 }
             }
             midi_schedule_dirty = true;
