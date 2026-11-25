@@ -451,7 +451,7 @@ impl EsperiaApp {
             show_device_panel: false,
             mixer_meters: None,
             show_mixer_panel: false,
-            master_volume: VolumeGlider::new(0.8),
+            master_volume: VolumeGlider::new(),
             midi_ports,
             selected_midi_port: None,
             _midi_connection: None,
@@ -763,10 +763,10 @@ impl EsperiaApp {
 
         let buses: Vec<BusConfig> = vec![];
 
-        let master_gain_db = if self.master_volume.value <= 0.001 {
+        let master_gain_db = if self.master_volume.value() <= 0.001 {
             -96.0
         } else {
-            20.0 * self.master_volume.value.log10()
+            20.0 * self.master_volume.value().log10()
         };
 
         match MixerGraph::new(&channel_cfgs, &buses, master_gain_db, max_frames) {

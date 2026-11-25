@@ -1,234 +1,435 @@
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 
-#[derive(Clone, Copy)]
+const WIDTH: f32 = 200.0;
+const HEIGHT: f32 = 24.0;
+
+const PADDING: f32 = 12.0;
+
+const BASE_SIZE: f32 = 18.0;
+const MAX_STRETCH: f32 = 6.0;
+
+const FIXED_STEP: f32 = 1.0 / 120.0;
+const MAX_FRAME_TIME: f32 = 0.05;
+
+const METER_HEIGHT: f32 = 2.5;
+const METER_SEGMENTS: usize = 128;
+
+const TRACK_COLOR: Color32 = Color32::from_rgb(50, 51, 53);
+
+#[derive(Clone, Copy, Default)]
 struct Node {
     x: f32,
     vx: f32,
 }
 
 pub struct VolumeGlider {
-    pub value: f32, // 0.0 to 1.0
-    target_x: f32,
-    nodes: [Node; 4],
     initialized: bool,
-}
 
-impl Default for VolumeGlider {
-    fn default() -> Self {
-        Self::new(0.0)
-    }
+    target_x: f32,
+
+    nodes: [Node; 4],
+
+    last_time: f64,
+
+    accumulator: f32,
+
+    pub value: f32,
 }
 
 impl VolumeGlider {
-    pub fn new(initial_value: f32) -> Self {
+    pub fn new() -> Self {
         Self {
-            value: initial_value.clamp(0.0, 1.0),
-            target_x: 0.0,
-            nodes: [Node { x: 0.0, vx: 0.0 }; 4],
             initialized: false,
+            target_x: PADDING,
+            nodes: [Node::default(); 4],
+            last_time: 0.0,
+            accumulator: 0.0,
+            value: 0.0,
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> Response {
-        let desired_size = Vec2::new(300.0, 36.0);
-        let (rect, mut response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
+    // ---------------------------------------------------------
+    // MAIN WIDGET
+    // ---------------------------------------------------------
 
-        let padding = 18.0; // Symmetrical 2.5px concentric gap on all sides
-        let base_size = 31.0;
-        let max_stretch = 18.0;
+    pub fn show(&mut self, ui: &mut Ui) -> Response {
+        let (rect, mut response) =
+            ui.allocate_exact_size(vec2(WIDTH, HEIGHT), Sense::click_and_drag());
 
-        let min_x = rect.left() + padding;
-        let max_x = rect.right() - padding;
-        let usable_width = (max_x - min_x).max(1.0);
+        let painter = ui.painter();
+
+        let min_x = PADDING;
+        let max_x = rect.width() - PADDING;
+
+        // -----------------------------------------------------
+        // INITIALIZATION
+        // -----------------------------------------------------
+
+        let time = ui.input(|i| i.time);
 
         if !self.initialized {
-            let start_x = min_x + self.value * usable_width;
-            self.target_x = start_x;
-            for node in &mut self.nodes {
-                node.x = start_x;
-                node.vx = 0.0;
-            }
+            let initial_x = min_x + self.value.clamp(0.0, 1.0) * (max_x - min_x);
+
+            self.target_x = initial_x;
+
+            self.nodes = [Node {
+                x: initial_x,
+                vx: 0.0,
+            }; 4];
+
+            self.last_time = time;
             self.initialized = true;
         }
 
-        // Handle pointer click or drag
+        // -----------------------------------------------------
+        // FRAME TIMING
+        // -----------------------------------------------------
+
+        let frame_time = ((time - self.last_time) as f32).clamp(0.0, MAX_FRAME_TIME);
+
+        self.last_time = time;
+
+        self.accumulator += frame_time;
+
+        // -----------------------------------------------------
+        // POINTER INPUT
+        // -----------------------------------------------------
+
         if response.is_pointer_button_down_on()
-            && let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos())
+            && let Some(pointer) = response.interact_pointer_pos()
         {
-            self.target_x = pointer_pos.x.clamp(min_x, max_x);
+            self.target_x = (pointer.x - rect.left()).clamp(min_x, max_x);
+        }
+        // -----------------------------------------------------
+        // FIXED TIMESTEP SPRING PHYSICS
+        // -----------------------------------------------------
+
+        while self.accumulator >= FIXED_STEP {
+            self.simulate_step(min_x, max_x);
+
+            self.accumulator -= FIXED_STEP;
         }
 
-        // Frame-rate normalized 4-part follow-through spring physics
-        let dt = (ui.input(|i| i.stable_dt) * 60.0).clamp(0.1, 2.0);
+        // -----------------------------------------------------
+        // CURRENT VALUE
+        // -----------------------------------------------------
 
-        // Part 1: Leading front edge
+        let previous_value = self.value;
+
+        self.value = ((self.nodes[0].x - min_x) / (max_x - min_x)).clamp(0.0, 1.0);
+
+        // Inform egui that the widget value has changed.
+        if (self.value - previous_value).abs() > 0.00001 {
+            response.mark_changed();
+        }
+
+        // -----------------------------------------------------
+        // STRETCH CALCULATION
+        // -----------------------------------------------------
+
+        let min_node = self.nodes.iter().map(|n| n.x).fold(f32::INFINITY, f32::min);
+
+        let max_node = self
+            .nodes
+            .iter()
+            .map(|n| n.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let stretch = (max_node - min_node).clamp(0.0, MAX_STRETCH);
+
+        let thumb_width = BASE_SIZE + stretch;
+
+        let thumb_height = (BASE_SIZE - stretch * 0.16).max(15.0);
+
+        // -----------------------------------------------------
+        // TRACK HOUSING
+        // -----------------------------------------------------
+
+        // Subtle track shadow.
+        // painter.rect_filled(
+        //     rect.translate(vec2(0.0, 2.0)),
+        //     HEIGHT / 2.0,
+        //     Color32::from_rgba_unmultiplied(0, 0, 0, 55),
+        // );
+
+        // Main capsule.
+        painter.rect_filled(rect, HEIGHT / 2.0, TRACK_COLOR);
+
+        // -----------------------------------------------------
+        // METER GEOMETRY
+        // -----------------------------------------------------
+
+        let meter_x = rect.left() + PADDING;
+
+        let meter_width = rect.width() - PADDING * 2.0;
+
+        let filled_width = meter_width * self.value;
+
+        // -----------------------------------------------------
+        // STEREO METERS
+        // -----------------------------------------------------
+
+        for row in 0..2 {
+            let meter_y = rect.center().y - 3.75;
+            let y = meter_y + row as f32 * 5.0;
+
+            self.draw_gradient_meter(painter, meter_x, y, meter_width, filled_width);
+
+            // -------------------------------------------------
+            // RED PEAK INDICATORS
+            // -------------------------------------------------
+
+            if self.value >= 0.90 {
+                let peak_color = if row == 0 {
+                    Color32::from_rgb(239, 68, 68)
+                } else {
+                    Color32::from_rgb(220, 38, 38)
+                };
+
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        pos2(meter_x + meter_width - 3.0, y),
+                        vec2(3.0, METER_HEIGHT),
+                    ),
+                    1.0,
+                    peak_color,
+                );
+            }
+        }
+
+        // -----------------------------------------------------
+        // THUMB POSITION
+        // -----------------------------------------------------
+
+        let thumb_rect = Rect::from_center_size(
+            pos2(
+                rect.left() + self.nodes[0].x.clamp(min_x, max_x),
+                rect.center().y,
+            ),
+            vec2(thumb_width, thumb_height),
+        );
+
+        let thumb_radius = thumb_height / 2.0;
+
+        // -----------------------------------------------------
+        // THUMB SHADOW
+        // -----------------------------------------------------
+
+        painter.rect_filled(
+            thumb_rect.translate(vec2(0.0, 2.0)),
+            thumb_radius,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+        );
+
+        // -----------------------------------------------------
+        // THUMB BODY
+        // -----------------------------------------------------
+
+        painter.rect_filled(
+            thumb_rect,
+            thumb_radius,
+            Color32::from_rgba_unmultiplied(216, 218, 221, 199),
+        );
+
+        // -----------------------------------------------------
+        // THUMB BORDER
+        // -----------------------------------------------------
+
+        painter.rect_stroke(
+            thumb_rect,
+            thumb_radius,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 71)),
+            egui::StrokeKind::Inside,
+        );
+
+        // -----------------------------------------------------
+        // ANIMATION REPAINT
+        // -----------------------------------------------------
+
+        let animating = self.nodes.iter().any(|n| n.vx.abs() > 0.01)
+            || (self.nodes[0].x - self.target_x).abs() > 0.05;
+
+        if animating || response.dragged() || response.clicked() {
+            ui.ctx().request_repaint();
+        }
+
+        response
+    }
+
+    // ---------------------------------------------------------
+    // FIXED TIMESTEP PHYSICS
+    // ---------------------------------------------------------
+
+    fn simulate_step(&mut self, min_x: f32, max_x: f32) {
+        // Use a critically damped spring in seconds so motion is stable and
+        // smooth across display refresh rates.
+        let dt = FIXED_STEP;
+
+        // -----------------------------------------------------
+        // NODE 1: LEADING EDGE
+        // -----------------------------------------------------
+
         let head = &mut self.nodes[0];
-        let head_force = (self.target_x - head.x) * 0.45 * dt;
-        head.vx = (head.vx + head_force) * 0.48_f32.powf(dt);
-        head.x = (head.x + head.vx * dt).clamp(min_x, max_x);
 
-        // Parts 2, 3, & 4: Trailing body & tail
+        const SPRING: f32 = 420.0;
+        const DAMPING: f32 = 40.987_804;
+
+        let head_acceleration = (self.target_x - head.x) * SPRING - head.vx * DAMPING;
+        head.vx += head_acceleration * dt;
+        head.x += head.vx * dt;
+
+        Self::clamp_node(head, min_x, max_x);
+
+        // -----------------------------------------------------
+        // NODES 2, 3, 4: FOLLOWING CHAIN
+        // -----------------------------------------------------
+
         for i in 1..4 {
             let leader_x = self.nodes[i - 1].x;
+
             let follower = &mut self.nodes[i];
-            let force = (leader_x - follower.x) * 0.32 * dt;
-            follower.vx = (follower.vx + force) * 0.50_f32.powf(dt);
-            follower.x = (follower.x + follower.vx * dt).clamp(min_x, max_x);
+
+            let acceleration = (leader_x - follower.x) * SPRING - follower.vx * DAMPING;
+            follower.vx += acceleration * dt;
+            follower.x += follower.vx * dt;
+
+            Self::clamp_node(follower, min_x, max_x);
         }
 
-        // Keep repainting while the 4-part chain is still settling
-        let is_moving = (self.target_x - self.nodes[0].x).abs() > 0.05
-            || (self.nodes[0].x - self.nodes[3].x).abs() > 0.05
-            || self.nodes[3].vx.abs() > 0.05;
+        // -----------------------------------------------------
+        // SETTLE MICRO VELOCITIES
+        // -----------------------------------------------------
 
-        if is_moving {
-            ui.ctx().request_repaint();
-        } else {
+        if (self.target_x - self.nodes[0].x).abs() < 0.05
+            && (self.nodes[0].x - self.nodes[3].x).abs() < 0.05
+            && self.nodes[3].vx.abs() < 0.05
+        {
             for node in &mut self.nodes {
                 node.x = self.target_x;
                 node.vx = 0.0;
             }
         }
+    }
 
-        // Update normalized volume value (0.0 .. 1.0)
-        let new_val = ((self.nodes[0].x - min_x) / usable_width).clamp(0.0, 1.0);
-        if (new_val - self.value).abs() > 0.001 {
-            self.value = new_val;
-            response.mark_changed();
+    // ---------------------------------------------------------
+    // STRAIGHT HORIZONTAL GRADIENT METER
+    // ---------------------------------------------------------
+
+    fn draw_gradient_meter(
+        &self,
+        painter: &egui::Painter,
+        x: f32,
+        y: f32,
+        width: f32,
+        filled_width: f32,
+    ) {
+        if filled_width <= 0.0 {
+            return;
         }
 
-        // --- Drawing ---
-        if ui.is_rect_visible(rect) {
-            let painter = ui.painter();
+        let segments = METER_SEGMENTS;
 
-            // 1. Dark charcoal capsule housing (#323335)
-            painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(50, 51, 53));
+        for i in 0..segments {
+            let t1 = i as f32 / segments as f32;
+            let t2 = (i + 1) as f32 / segments as f32;
 
-            // 2. Stereo 7:2:1 gradient meter bars
-            let bar_height = 5.5;
-            let gap = 4.0;
-            let top_bar_y = rect.center().y - gap * 0.5 - bar_height;
-            let bot_bar_y = rect.center().y + gap * 0.5;
-            let fill_width = self.value * usable_width;
+            let x1 = x + t1 * width;
+            let x2 = x + t2 * width;
 
-            if fill_width > 0.5 {
-                let top_rect = Rect::from_min_size(
-                    Pos2::new(min_x, top_bar_y),
-                    Vec2::new(fill_width, bar_height),
-                );
-                let bot_rect = Rect::from_min_size(
-                    Pos2::new(min_x, bot_bar_y),
-                    Vec2::new(fill_width, bar_height),
-                );
-                draw_gradient_bar(painter, top_rect, usable_width);
-                draw_gradient_bar(painter, bot_rect, usable_width);
+            if x1 >= x + filled_width {
+                break;
             }
 
-            // 3. Red clip / peak hold ticks (>= 90%)
-            if self.value >= 0.90 {
-                let tick_x = max_x - 3.0;
-                painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(tick_x, top_bar_y), Vec2::new(3.0, bar_height)),
-                    CornerRadius::same(1),
-                    Color32::from_rgb(239, 68, 68),
-                );
-                painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(tick_x, bot_bar_y), Vec2::new(3.0, bar_height)),
-                    CornerRadius::same(1),
-                    Color32::from_rgb(220, 38, 38),
-                );
-            }
+            // Clip final segment to current volume.
+            let end_x = x2.min(x + filled_width);
 
-            // 4. Stretchy frosted circular thumb
-            let min_node_x = self.nodes.iter().map(|n| n.x).fold(f32::INFINITY, f32::min);
-            let max_node_x = self
-                .nodes
-                .iter()
-                .map(|n| n.x)
-                .fold(f32::NEG_INFINITY, f32::max);
+            let color = Self::gradient_color((t1 + t2) * 0.5);
 
-            let stretch_span = (max_node_x - min_node_x).min(max_stretch);
-            let current_width = base_size + stretch_span;
-            let current_height = (base_size - stretch_span * 0.16).max(26.0);
+            // IMPORTANT:
+            // Zero rounding keeps every segment perfectly
+            // rectangular, creating a straight meter bar.
+            // Slight overlap prevents tiny rendering gaps.
 
-            let min_left_edge = min_x - base_size * 0.5;
-            let max_right_edge = max_x + base_size * 0.5;
-            let left_edge =
-                (min_node_x - base_size * 0.5).clamp(min_left_edge, max_right_edge - current_width);
-
-            let thumb_rect = Rect::from_center_size(
-                Pos2::new(left_edge + current_width * 0.5, rect.center().y),
-                Vec2::new(current_width, current_height),
-            );
-
-            let fill_alpha = if response.is_pointer_button_down_on() {
-                225
-            } else {
-                198
-            };
             painter.rect_filled(
-                thumb_rect,
-                CornerRadius::same((current_height * 0.5) as u8),
-                Color32::from_rgba_unmultiplied(216, 218, 221, fill_alpha),
-            );
-            painter.rect_stroke(
-                thumb_rect,
-                CornerRadius::same((current_height * 0.5) as u8),
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 72)),
-                egui::StrokeKind::Inside,
-            );
-        }
-
-        response
-    }
-}
-
-/// Renders the locked 7:2:1 Green -> Yellow -> Red gradient clipped to the current volume width
-fn draw_gradient_bar(painter: &egui::Painter, rect: Rect, full_width: f32) {
-    let stops: &[(f32, Color32)] = &[
-        (0.00, Color32::from_rgb(34, 197, 94)),  // Green
-        (0.55, Color32::from_rgb(60, 208, 84)),  // Bright Green
-        (0.80, Color32::from_rgb(238, 212, 28)), // Yellow
-        (0.92, Color32::from_rgb(249, 115, 22)), // Orange
-        (1.00, Color32::from_rgb(239, 68, 68)),  // Red
-    ];
-
-    let segments = 24;
-    for i in 0..segments {
-        let t0 = i as f32 / segments as f32;
-        let t1 = (i + 1) as f32 / segments as f32;
-        let seg_x0 = rect.left() + t0 * rect.width();
-        let seg_x1 = rect.left() + t1 * rect.width();
-
-        // Sample color based on absolute position along the full track (not stretched)
-        let track_t = ((seg_x0 + seg_x1) * 0.5 - rect.left()) / full_width;
-        let color = sample_gradient(stops, track_t.clamp(0.0, 1.0));
-
-        let seg_rect = Rect::from_min_max(
-            Pos2::new(seg_x0, rect.top()),
-            Pos2::new(seg_x1 + 0.5, rect.bottom()),
-        );
-        let rounding = if i == 0 || i == segments - 1 {
-            CornerRadius::same(3)
-        } else {
-            CornerRadius::ZERO
-        };
-        painter.rect_filled(seg_rect, rounding, color);
-    }
-}
-
-fn sample_gradient(stops: &[(f32, Color32)], t: f32) -> Color32 {
-    for window in stops.windows(2) {
-        let (t0, c0) = window[0];
-        let (t1, c1) = window[1];
-        if t >= t0 && t <= t1 {
-            let local_t = (t - t0) / (t1 - t0);
-            return Color32::from_rgb(
-                (c0.r() as f32 + (c1.r() as f32 - c0.r() as f32) * local_t) as u8,
-                (c0.g() as f32 + (c1.g() as f32 - c0.g() as f32) * local_t) as u8,
-                (c0.b() as f32 + (c1.b() as f32 - c0.b() as f32) * local_t) as u8,
+                Rect::from_min_max(pos2(x1, y), pos2(end_x + 0.15, y + METER_HEIGHT)),
+                0.0,
+                color,
             );
         }
     }
-    stops.last().unwrap().1
+
+    // ---------------------------------------------------------
+    // CONTINUOUS 7:2:1 COLOR GRADIENT
+    // ---------------------------------------------------------
+
+    fn gradient_color(t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+
+        let stops = [
+            (0.00, Color32::from_rgb(34, 197, 94)),
+            (0.55, Color32::from_rgb(60, 208, 84)),
+            (0.80, Color32::from_rgb(238, 212, 28)),
+            (0.92, Color32::from_rgb(249, 115, 22)),
+            (1.00, Color32::from_rgb(239, 68, 68)),
+        ];
+
+        for i in 0..stops.len() - 1 {
+            let (p1, c1) = stops[i];
+            let (p2, c2) = stops[i + 1];
+
+            if t <= p2 {
+                let f = ((t - p1) / (p2 - p1)).clamp(0.0, 1.0);
+
+                return Color32::from_rgb(
+                    Self::lerp_channel(c1.r(), c2.r(), f),
+                    Self::lerp_channel(c1.g(), c2.g(), f),
+                    Self::lerp_channel(c1.b(), c2.b(), f),
+                );
+            }
+        }
+
+        Color32::RED
+    }
+
+    fn lerp_channel(a: u8, b: u8, t: f32) -> u8 {
+        (a as f32 * (1.0 - t) + b as f32 * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+
+    // ---------------------------------------------------------
+    // BOUNDARY CONSTRAINTS
+    // ---------------------------------------------------------
+
+    fn clamp_node(node: &mut Node, min: f32, max: f32) {
+        if node.x < min {
+            node.x = min;
+            node.vx = 0.0;
+        } else if node.x > max {
+            node.x = max;
+            node.vx = 0.0;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // COMPATIBILITY WITH MAIN.RS
+    // ---------------------------------------------------------
+
+    pub fn ui(&mut self, ui: &mut Ui) -> Response {
+        self.show(ui)
+    }
+
+    // ---------------------------------------------------------
+    // GET CURRENT VOLUME
+    // ---------------------------------------------------------
+
+    pub fn value(&self) -> f32 {
+        self.value
+    }
+}
+
+impl Default for VolumeGlider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
