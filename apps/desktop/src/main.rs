@@ -1184,10 +1184,17 @@ impl eframe::App for EsperiaApp {
                 });
             });
 
-        // ── Transport bar ─────────────────────────────────────────────────────
-        egui::Panel::top("transport").show(ui, |ui| {
-            self.draw_transport(ui);
-        });
+        // ── Transport bar (Logic Pro brushed-slate Control Bar) ───────────────
+        egui::Panel::top("transport")
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(76, 76, 82))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 42, 45)))
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show(ui, |ui| {
+                self.draw_transport(ui);
+            });
 
         // ── Device panel (optional sidebar) ───────────────────────────────────
         if self.show_device_panel {
@@ -1558,21 +1565,51 @@ impl EsperiaApp {
             }
 
             ui.separator();
-            ui.strong("Piano Roll");
-            ui.separator();
-            ui.label("Height:");
-            ui.add(egui::Slider::new(&mut self.piano_roll_height, 180.0..=max_h).show_value(false));
-            let is_expanded = self.piano_roll_height >= max_h - 40.0;
+            let pr_on = !self.piano_roll_state.show_velocity_lane;
             if ui
-                .button(if is_expanded {
-                    "⤡ Restore"
+                .add(egui::Button::new("Piano Roll").fill(if pr_on {
+                    egui::Color32::from_rgb(35, 115, 215)
                 } else {
-                    "⤢ Expand"
-                })
+                    egui::Color32::from_gray(64)
+                }))
                 .clicked()
             {
-                self.piano_roll_height = if is_expanded { 300.0 } else { max_h };
+                self.piano_roll_state.show_velocity_lane = false;
             }
+            if ui
+                .add(egui::Button::new("Piano Roll + Velocity").fill(if !pr_on {
+                    egui::Color32::from_rgb(35, 115, 215)
+                } else {
+                    egui::Color32::from_gray(64)
+                }))
+                .clicked()
+            {
+                self.piano_roll_state.show_velocity_lane = true;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let is_expanded = self.piano_roll_height >= max_h - 40.0;
+                if ui
+                    .button(if is_expanded {
+                        "⤡ Restore"
+                    } else {
+                        "⤢ Expand"
+                    })
+                    .clicked()
+                {
+                    self.piano_roll_height = if is_expanded { 300.0 } else { max_h };
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.piano_roll_height, 180.0..=max_h).show_value(false),
+                );
+                ui.weak("↕");
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut self.piano_roll_state.px_per_tick, 0.015..=0.25)
+                        .show_value(false),
+                );
+                ui.weak("↔");
+            });
         });
 
         let active_tid = self.active_midi_track_id.unwrap_or(0);
@@ -2038,25 +2075,20 @@ impl EsperiaApp {
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
 
-        // ── Zoom / scroll / clip actions bar ──────────────────────────────────
+        // ── Zoom / track-add / clip actions bar (Logic Pro Tracks sub-bar) ──
         ui.horizontal(|ui| {
-            ui.label("Zoom:");
-            if ui.button("−").clicked() {
-                self.timeline_zoom = (self.timeline_zoom * 0.8).max(MIN_ZOOM);
+            if ui.button("➕ Audio").clicked() {
+                let idx = self.project_session.project().tracks.len() + 1;
+                let _ = self.project_session.execute(ProjectCommand::AddTrack {
+                    name: format!("Track {idx}"),
+                });
             }
-            ui.label(format!(
-                "{:.0} px/s",
-                self.timeline_zoom * self.active_sample_rate as f32
-            ));
-            if ui.button("+").clicked() {
-                self.timeline_zoom = (self.timeline_zoom * 1.25).min(MAX_ZOOM);
-            }
-            if ui.button("Fit").clicked() {
-                self.timeline_zoom = DEFAULT_ZOOM;
+            if ui.button("➕ MIDI").clicked() {
+                self.add_midi_track();
             }
             if let Some(sel_id) = self.selected_clip {
                 ui.separator();
-                if ui.button("🗑 Delete Selected Clip").clicked() {
+                if ui.button("🗑 Delete Clip").clicked() {
                     let _ = self
                         .project_session
                         .execute(ProjectCommand::DeleteClip { clip_id: sel_id });
@@ -2066,7 +2098,7 @@ impl EsperiaApp {
             }
             if let (Some(tid), Some(cid)) = (self.active_midi_track_id, self.active_midi_clip_id) {
                 ui.separator();
-                if ui.button("🗑 Delete MIDI Region").clicked() {
+                if ui.button("🗑 Delete Region").clicked() {
                     let proj = self.project_session.project_mut();
                     if let Some(t) = proj.midi_tracks.iter_mut().find(|t| t.id == tid) {
                         t.clips.retain(|c| c.id != cid);
@@ -2075,6 +2107,15 @@ impl EsperiaApp {
                     self.rebuild_midi_schedule();
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Fit").clicked() {
+                    self.timeline_zoom = DEFAULT_ZOOM;
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.timeline_zoom, MIN_ZOOM..=0.05).show_value(false),
+                );
+                ui.weak("↔");
+            });
         });
 
         ui.separator();
@@ -2227,7 +2268,7 @@ impl EsperiaApp {
                     egui::pos2(rect.left(), lane_top + 1.0),
                     egui::vec2(TRACK_HEADER_WIDTH - 2.0, TRACK_HEIGHT - 2.0),
                 );
-                painter.rect_filled(header_rect, 2.0, egui::Color32::from_rgb(56, 56, 60));
+                painter.rect_filled(header_rect, 2.0, egui::Color32::from_rgb(84, 84, 90));
                 painter.rect_filled(
                     egui::Rect::from_min_size(header_rect.min, egui::vec2(4.0, header_rect.height())),
                     0.0,
@@ -2427,9 +2468,9 @@ impl EsperiaApp {
                     header_rect,
                     2.0,
                     if is_active_midi {
-                        egui::Color32::from_rgb(64, 68, 66)
+                        egui::Color32::from_rgb(90, 92, 96)
                     } else {
-                        egui::Color32::from_rgb(56, 56, 60)
+                        egui::Color32::from_rgb(80, 80, 86)
                     },
                 );
                 painter.rect_filled(
