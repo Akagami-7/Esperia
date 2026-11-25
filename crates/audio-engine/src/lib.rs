@@ -14,6 +14,7 @@
 //! * `ScheduledClip` holds an `Arc<DecodedSamples>` (a type-alias for
 //!   `Arc<Vec<f32>>`) so the callback can read decoded audio without allocation.
 
+use std::cell::UnsafeCell;
 use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::sync::atomic::{
@@ -57,6 +58,8 @@ pub enum EngineCommand {
     SetLoopRegion { start: u64, end: u64 },
     /// Enable or disable looping.
     EnableLoop(bool),
+    /// Enable or disable live input monitoring pass-through.
+    EnableInputMonitoring(bool),
 }
 
 impl EngineCommand {
@@ -91,6 +94,7 @@ impl EngineCommand {
                 [7, s_lo, e_lo, hi_packed]
             }
             Self::EnableLoop(b) => [8, b as u32, 0, 0],
+            Self::EnableInputMonitoring(b) => [9, b as u32, 0, 0],
         }
     }
 
@@ -120,8 +124,74 @@ impl EngineCommand {
                 Some(Self::SetLoopRegion { start, end })
             }
             8 => Some(Self::EnableLoop(raw[1] != 0)),
+            9 => Some(Self::EnableInputMonitoring(raw[1] != 0)),
             _ => None,
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MonitorRing — lock-free SPSC ring for live input monitoring
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Preallocated, lock-free SPSC ring buffer for routing live input samples
+/// from the input callback thread to the output `AudioEngine::process` callback.
+pub struct MonitorRing {
+    buffer: Box<[UnsafeCell<f32>]>,
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+// SAFETY: SPSC contract (input callback pushes, output callback pops).
+unsafe impl Send for MonitorRing {}
+unsafe impl Sync for MonitorRing {}
+
+impl MonitorRing {
+    pub fn new(min_capacity_samples: usize) -> Self {
+        let cap = min_capacity_samples.max(256).next_power_of_two();
+        let buffer: Vec<UnsafeCell<f32>> = (0..cap).map(|_| UnsafeCell::new(0.0)).collect();
+        Self {
+            buffer: buffer.into_boxed_slice(),
+            mask: cap - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push captured samples from the input callback (real-time safe, drops oldest
+    /// excess if full rather than blocking).
+    #[inline]
+    pub fn push_samples(&self, samples: &[f32]) {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        let used = head.wrapping_sub(tail);
+        let free = (self.mask + 1).saturating_sub(used);
+        let to_write = samples.len().min(free);
+        for (i, &s) in samples.iter().take(to_write).enumerate() {
+            let idx = (head.wrapping_add(i)) & self.mask;
+            unsafe {
+                *self.buffer[idx].get() = s;
+            }
+        }
+        self.head
+            .store(head.wrapping_add(to_write), Ordering::Release);
+    }
+
+    /// Pop up to `dst.len()` samples into `dst` (output callback, real-time safe).
+    #[inline]
+    pub fn pop_samples(&self, dst: &mut [f32]) -> usize {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let avail = head.wrapping_sub(tail);
+        let to_read = dst.len().min(avail);
+        for (i, slot) in dst.iter_mut().take(to_read).enumerate() {
+            let idx = (tail.wrapping_add(i)) & self.mask;
+            *slot = unsafe { *self.buffer[idx].get() };
+        }
+        self.tail
+            .store(tail.wrapping_add(to_read), Ordering::Release);
+        to_read
     }
 }
 
@@ -421,6 +491,8 @@ pub struct EngineHandle {
     pub telemetry: Arc<EngineTelemetry>,
     /// Lock-free pointer to the current `ClipSchedule`.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Lock-free ring for live input monitoring (written by input callback).
+    monitor_ring: Arc<MonitorRing>,
 }
 
 impl EngineHandle {
@@ -466,6 +538,14 @@ impl EngineHandle {
 
     pub fn enable_loop(&self, enabled: bool) {
         self.send(EngineCommand::EnableLoop(enabled));
+    }
+
+    pub fn set_input_monitoring(&self, enabled: bool) {
+        self.send(EngineCommand::EnableInputMonitoring(enabled));
+    }
+
+    pub fn monitor_ring(&self) -> Arc<MonitorRing> {
+        Arc::clone(&self.monitor_ring)
     }
 
     pub fn set_frequency(&self, hz: f32) {
@@ -544,8 +624,13 @@ pub struct AudioEngine {
     loop_start: u64,
     loop_end: u64,
     loop_enabled: bool,
+    input_monitoring_enabled: bool,
     /// Shared pointer to the current clip schedule.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Preallocated SPSC ring for live input monitoring.
+    monitor_ring: Arc<MonitorRing>,
+    /// Preallocated scratch buffer for draining monitor samples.
+    monitor_scratch: Vec<f32>,
 }
 
 impl AudioEngine {
@@ -556,15 +641,18 @@ impl AudioEngine {
         let commands = Arc::new(CommandRing::<64>::new());
         let telemetry = Arc::new(EngineTelemetry::new());
         let schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let monitor_ring = Arc::new(MonitorRing::new(16_384));
 
         let handle = EngineHandle {
             commands: Arc::clone(&commands),
             telemetry: Arc::clone(&telemetry),
             schedule_ptr: Arc::clone(&schedule_ptr),
+            monitor_ring: Arc::clone(&monitor_ring),
         };
 
         // Preallocate for the largest expected buffer (2048 frames × channels).
         let scratch = vec![0.0f32; 2048 * ch];
+        let monitor_scratch = vec![0.0f32; 4096 * ch];
 
         let engine = Self {
             generator: SineGenerator::new(440.0, 0.1, sr, ch),
@@ -578,7 +666,10 @@ impl AudioEngine {
             loop_start: 0,
             loop_end: u64::MAX,
             loop_enabled: false,
+            input_monitoring_enabled: false,
             schedule_ptr,
+            monitor_ring,
+            monitor_scratch,
         };
 
         (engine, handle)
@@ -651,6 +742,9 @@ impl AudioEngine {
                 EngineCommand::EnableLoop(b) => {
                     self.loop_enabled = b;
                 }
+                EngineCommand::EnableInputMonitoring(b) => {
+                    self.input_monitoring_enabled = b;
+                }
                 EngineCommand::SetFrequency(f) => self.generator.set_frequency(f),
                 EngineCommand::SetAmplitude(a) => self.generator.set_amplitude(a),
                 EngineCommand::Reconfigure {
@@ -718,6 +812,23 @@ impl AudioEngine {
                 .store(new_head, Ordering::Release);
         } else {
             output.fill(0.0);
+        }
+
+        // ── mix live input monitoring (real-time safe, zero alloc) ─────────
+        if self.input_monitoring_enabled {
+            let max_drain = output.len().min(self.monitor_scratch.len());
+            let read = self
+                .monitor_ring
+                .pop_samples(&mut self.monitor_scratch[..max_drain]);
+            for i in 0..read {
+                output[i] += self.monitor_scratch[i];
+            }
+        } else {
+            // Drain stale monitor samples silently so buffer stays fresh.
+            let max_drain = output.len().min(self.monitor_scratch.len());
+            let _ = self
+                .monitor_ring
+                .pop_samples(&mut self.monitor_scratch[..max_drain]);
         }
 
         // ── compute peak for telemetry ─────────────────────────────────────

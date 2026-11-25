@@ -76,6 +76,14 @@ pub enum ProjectCommand {
         track_id: TrackId,
         soloed: bool,
     },
+    SetTrackRecordArmed {
+        track_id: TrackId,
+        armed: bool,
+    },
+    SetTrackInputChannel {
+        track_id: TrackId,
+        channel: Option<u16>,
+    },
 }
 
 /// Identifier or confirmation returned after executing a [`ProjectCommand`].
@@ -362,6 +370,20 @@ fn apply_command(
                 .find_track_mut(track_id)
                 .ok_or(ProjectError::TrackNotFound(track_id))?;
             track.soloed = soloed;
+            Ok(CommandOutcome::TrackUpdated(track_id))
+        }
+        ProjectCommand::SetTrackRecordArmed { track_id, armed } => {
+            let track = project
+                .find_track_mut(track_id)
+                .ok_or(ProjectError::TrackNotFound(track_id))?;
+            track.record_armed = armed;
+            Ok(CommandOutcome::TrackUpdated(track_id))
+        }
+        ProjectCommand::SetTrackInputChannel { track_id, channel } => {
+            let track = project
+                .find_track_mut(track_id)
+                .ok_or(ProjectError::TrackNotFound(track_id))?;
+            track.input_channel = channel;
             Ok(CommandOutcome::TrackUpdated(track_id))
         }
     }

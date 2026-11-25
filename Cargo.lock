@@ -1168,6 +1168,7 @@ dependencies = [
  "esperia-audio-io",
  "esperia-media",
  "esperia-project-model",
+ "esperia-recording",
  "rfd",
  "tracing",
  "tracing-subscriber",
@@ -1191,6 +1192,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "esperia-recording"
+version = "0.1.0"
+dependencies = [
+ "esperia-audio-engine",
+ "esperia-media",
+ "esperia-project-model",
  "tempfile",
 ]
 

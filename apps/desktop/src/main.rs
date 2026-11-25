@@ -12,7 +12,7 @@
 //! wires them together as the top-level coordinator.
 
 use eframe::egui;
-use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, ScheduledClip};
+use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, MonitorRing, ScheduledClip};
 use esperia_audio_io::{AudioDeviceInfo, AudioDeviceManager, StreamErrorChannel, cpal};
 use esperia_media::{AssetManager, DecodedAudio, LoadStatus};
 use esperia_project_model::{
@@ -22,6 +22,9 @@ use esperia_project_model::{
     persistence::{load_project, save_project},
     project::Project,
     track::TrackId,
+};
+use esperia_recording::{
+    InputChannelSelection, LatencyConfig, PunchRegion, Recorder, RecordingStatus,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,9 +108,25 @@ struct EsperiaApp {
     buffer_frames_hint: Arc<AtomicU32>,
     stream_errors: StreamErrorChannel,
 
+    // ── Audio input & recording subsystem ────────────────────────────────
+    input_devices: Vec<AudioDeviceInfo>,
+    selected_input_device_name: String,
+    _input_stream: Option<cpal::Stream>,
+    input_stream_active: Arc<AtomicBool>,
+    input_sample_rate: u32,
+    input_channels: u16,
+    input_buffer_frames_hint: Arc<AtomicU32>,
+    input_stream_errors: StreamErrorChannel,
+    selected_input_channel: u16,
+    recorder: Recorder,
+    input_monitoring: bool,
+    punch_enabled: bool,
+
     // ── Project ──────────────────────────────────────────────────────────
     project_session: ProjectSession,
     project_bundle_dir: Option<PathBuf>,
+    /// Tracks absolute paths of imported/recorded sources before saving into bundle.
+    source_abs_paths: HashMap<SourceId, PathBuf>,
 
     // ── Asset management ─────────────────────────────────────────────────
     asset_manager: AssetManager,
@@ -140,6 +159,7 @@ fn open_stream(
     mut engine: AudioEngine,
     stream_active: Arc<AtomicBool>,
     buffer_frames_hint: Arc<AtomicU32>,
+    rec_telemetry: Arc<esperia_recording::RecordingTelemetry>,
     error_channel: StreamErrorChannel,
 ) -> (Option<cpal::Stream>, u32, u16, String) {
     let dev_result = if device_name.is_empty() {
@@ -160,11 +180,22 @@ fn open_stream(
     let bfh = buffer_frames_hint.clone();
     let stream_flag = stream_active.clone();
 
-    let result = mgr.build_output_stream(&dev, sr, ch, error_channel, move |data: &mut [f32]| {
-        let frames = (data.len() / ch as usize) as u32;
-        bfh.store(frames, Ordering::Relaxed);
-        engine.process(data, budget_ns);
-    });
+    let result = mgr.build_output_stream_with_timing(
+        &dev,
+        sr,
+        ch,
+        error_channel,
+        move |data: &mut [f32], latency_ns: Option<u64>| {
+            let frames = (data.len() / ch as usize) as u32;
+            bfh.store(frames, Ordering::Relaxed);
+            if let Some(ns) = latency_ns {
+                rec_telemetry
+                    .last_output_latency_ns
+                    .store(ns, Ordering::Relaxed);
+            }
+            engine.process(data, budget_ns);
+        },
+    );
 
     match result {
         Ok(stream) => {
@@ -181,6 +212,70 @@ fn open_stream(
     }
 }
 
+fn open_input_stream(
+    mgr: &AudioDeviceManager,
+    device_name: &str,
+    recorder: &Recorder,
+    engine_handle: &EngineHandle,
+    stream_active: Arc<AtomicBool>,
+    buffer_frames_hint: Arc<AtomicU32>,
+    error_channel: StreamErrorChannel,
+) -> (Option<cpal::Stream>, u32, u16) {
+    let dev_result = if device_name.is_empty() {
+        mgr.default_input_device()
+    } else {
+        mgr.find_input_device_by_name(device_name)
+            .or_else(|_| mgr.default_input_device())
+    };
+
+    let Ok(dev) = dev_result else {
+        return (None, 48_000, 1);
+    };
+
+    let (sr, ch) = AudioDeviceManager::default_input_config_params(&dev);
+    let Ok(mut capture) = recorder.build_input_capture(ch) else {
+        return (None, sr, ch);
+    };
+
+    let monitor_ring: Arc<MonitorRing> = engine_handle.monitor_ring();
+    let telemetry = engine_handle.telemetry.clone();
+    let rec_telemetry = recorder.telemetry();
+    let bfh = buffer_frames_hint;
+    let stream_flag = stream_active;
+
+    let result = mgr.build_input_stream(
+        &dev,
+        sr,
+        ch,
+        error_channel,
+        move |data: &[f32], latency_ns: Option<u64>| {
+            let frames = (data.len() / ch.max(1) as usize) as u32;
+            bfh.store(frames, Ordering::Relaxed);
+            let timeline_frame = telemetry.playhead_frame();
+            capture.on_input_samples(data, timeline_frame, latency_ns);
+            if recorder_mon_enabled(&rec_telemetry, &capture) {
+                monitor_ring.push_samples(capture.last_captured_slice());
+            }
+        },
+    );
+
+    match result {
+        Ok(stream) => {
+            stream_flag.store(true, Ordering::Release);
+            (Some(stream), sr, ch)
+        }
+        Err(_) => (None, sr, ch),
+    }
+}
+
+#[inline]
+fn recorder_mon_enabled(
+    _tel: &esperia_recording::RecordingTelemetry,
+    capture: &esperia_recording::InputCapture,
+) -> bool {
+    !capture.last_captured_slice().is_empty()
+}
+
 impl EsperiaApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let _ = tracing_subscriber::fmt()
@@ -193,21 +288,31 @@ impl EsperiaApp {
         let buffer_frames_hint = Arc::new(AtomicU32::new(512));
         let stream_errors = StreamErrorChannel::new();
 
-        let (mgr, output_devices, selected_device_name) = match AudioDeviceManager::new() {
-            Ok(m) => {
-                let devs = m.enumerate_output_devices().unwrap_or_default();
-                let default_name = devs
-                    .iter()
-                    .find(|d| d.is_default_output)
-                    .map(|d| d.name.clone())
-                    .unwrap_or_default();
-                (Some(m), devs, default_name)
-            }
-            Err(e) => {
-                tracing::warn!("AudioDeviceManager init failed: {e}");
-                (None, vec![], String::new())
-            }
-        };
+        let (mgr, output_devices, selected_device_name, input_devices, selected_input_device_name) =
+            match AudioDeviceManager::new() {
+                Ok(m) => {
+                    let out_devs = m.enumerate_output_devices().unwrap_or_default();
+                    let default_out = out_devs
+                        .iter()
+                        .find(|d| d.is_default_output)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
+                    let in_devs = m.enumerate_input_devices().unwrap_or_default();
+                    let default_in = in_devs
+                        .iter()
+                        .find(|d| d.is_default_input)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
+                    (Some(m), out_devs, default_out, in_devs, default_in)
+                }
+                Err(e) => {
+                    tracing::warn!("AudioDeviceManager init failed: {e}");
+                    (None, vec![], String::new(), vec![], String::new())
+                }
+            };
+
+        let recording_staging_dir = std::env::temp_dir().join("esperia_recordings");
+        let recorder = Recorder::new(recording_staging_dir.clone());
 
         let (stream, active_sr, active_ch, status) = if let Some(ref m) = mgr {
             open_stream(
@@ -216,10 +321,29 @@ impl EsperiaApp {
                 engine,
                 Arc::clone(&stream_active),
                 Arc::clone(&buffer_frames_hint),
+                recorder.telemetry(),
                 stream_errors.clone(),
             )
         } else {
             (None, 48_000, 2, "No audio device manager".into())
+        };
+
+        let input_stream_active = Arc::new(AtomicBool::new(false));
+        let input_buffer_frames_hint = Arc::new(AtomicU32::new(512));
+        let input_stream_errors = StreamErrorChannel::new();
+
+        let (input_stream, input_sr, input_ch) = if let Some(ref m) = mgr {
+            open_input_stream(
+                m,
+                &selected_input_device_name,
+                &recorder,
+                &engine_handle,
+                Arc::clone(&input_stream_active),
+                Arc::clone(&input_buffer_frames_hint),
+                input_stream_errors.clone(),
+            )
+        } else {
+            (None, 48_000, 1)
         };
 
         let project = Project::new("Untitled".to_string(), active_sr, 120.0)
@@ -238,8 +362,21 @@ impl EsperiaApp {
             active_channels: active_ch,
             buffer_frames_hint,
             stream_errors,
+            input_devices,
+            selected_input_device_name,
+            _input_stream: input_stream,
+            input_stream_active,
+            input_sample_rate: input_sr,
+            input_channels: input_ch,
+            input_buffer_frames_hint,
+            input_stream_errors,
+            selected_input_channel: 0,
+            recorder,
+            input_monitoring: false,
+            punch_enabled: false,
             project_session,
             project_bundle_dir: None,
+            source_abs_paths: HashMap::new(),
             asset_manager,
             thumbnail_cache: ThumbnailCache::new(),
             pending_imports: Vec::new(),
@@ -273,6 +410,7 @@ impl EsperiaApp {
             engine,
             Arc::clone(&self.stream_active),
             Arc::clone(&self.buffer_frames_hint),
+            self.recorder.telemetry(),
             self.stream_errors.clone(),
         );
 
@@ -283,7 +421,176 @@ impl EsperiaApp {
         self.selected_device_name = device_name.to_owned();
         self.status_message = status;
         self.engine_handle.reconfigure(sr as f32, ch);
+        self.engine_handle
+            .set_input_monitoring(self.input_monitoring);
         self.rebuild_schedule();
+        self.switch_input_device(&self.selected_input_device_name.clone());
+    }
+
+    fn switch_input_device(&mut self, device_name: &str) {
+        let Some(mgr) = &self.device_manager else {
+            return;
+        };
+        self.input_stream_active.store(false, Ordering::Release);
+        let (stream, sr, ch) = open_input_stream(
+            mgr,
+            device_name,
+            &self.recorder,
+            &self.engine_handle,
+            Arc::clone(&self.input_stream_active),
+            Arc::clone(&self.input_buffer_frames_hint),
+            self.input_stream_errors.clone(),
+        );
+        self._input_stream = stream;
+        self.input_sample_rate = sr;
+        self.input_channels = ch;
+        self.selected_input_device_name = device_name.to_owned();
+    }
+
+    // ── Recording control ─────────────────────────────────────────────────────
+
+    fn toggle_recording(&mut self) {
+        if matches!(self.recorder.status(), RecordingStatus::Recording { .. }) {
+            // Stop recording and playback.
+            self.engine_handle.pause();
+            let latency = LatencyConfig {
+                input_latency_ns: 0,
+                output_latency_ns: 0,
+                input_buffer_frames: self.input_buffer_frames_hint.load(Ordering::Relaxed),
+                output_buffer_frames: self.buffer_frames_hint.load(Ordering::Relaxed),
+                input_sample_rate: self.input_sample_rate,
+                output_sample_rate: self.active_sample_rate,
+                project_sample_rate: self.active_sample_rate,
+                manual_offset_frames: 0,
+            };
+            match self.recorder.stop_recording(latency) {
+                Ok(take) => {
+                    self.ingest_recorded_take(&take);
+                }
+                Err(e) => {
+                    self.status_message = format!("Recording error: {e}");
+                }
+            }
+            return;
+        }
+
+        // Ensure an armed track exists (auto-create one if project has none, or
+        // use the armed track).
+        let armed_track_id = self
+            .project_session
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.record_armed)
+            .map(|t| t.id)
+            .or_else(|| self.recorder.armed_track());
+
+        let track_id = match armed_track_id {
+            Some(tid) => tid,
+            None => {
+                // Auto-create and arm a new audio track for convenience.
+                let idx = self.project_session.project().tracks.len() + 1;
+                match self.project_session.execute(ProjectCommand::AddTrack {
+                    name: format!("Audio {idx}"),
+                }) {
+                    Ok(CommandOutcome::TrackAdded(tid)) => {
+                        let _ = self
+                            .project_session
+                            .execute(ProjectCommand::SetTrackRecordArmed {
+                                track_id: tid,
+                                armed: true,
+                            });
+                        tid
+                    }
+                    _ => return,
+                }
+            }
+        };
+
+        if let Err(e) = self.recorder.arm_track(Some(track_id)) {
+            self.status_message = format!("Arm error: {e}");
+            return;
+        }
+
+        let start_frame = self.engine_handle.playhead_frame();
+        if let Err(e) = self.recorder.start_recording(
+            start_frame,
+            self.input_sample_rate,
+            self.active_sample_rate,
+            self.input_channels.max(1),
+        ) {
+            self.status_message = format!("Start recording failed: {e}");
+            return;
+        }
+
+        // Start playback simultaneously so existing tracks play (overdubbing).
+        self.engine_handle.play();
+        self.status_message = "Recording…".into();
+    }
+
+    fn ingest_recorded_take(&mut self, take: &esperia_recording::TakeInfo) {
+        if take.duration_frames == 0 {
+            self.status_message = "Recording stopped (0 frames captured)".into();
+            return;
+        }
+
+        let file_name = take
+            .file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("take.wav");
+        let relative_path = PathBuf::from("Audio").join(file_name);
+        let clip_name = format!("Take {}", take.take_number);
+
+        let decoded = match esperia_media::decode::decode_audio(
+            &take.file_path,
+            Some(self.active_sample_rate),
+        ) {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                self.status_message = format!("Failed to decode recorded take: {e}");
+                return;
+            }
+        };
+
+        let source_id = match self.project_session.execute(ProjectCommand::ImportAudio {
+            name: clip_name.clone(),
+            relative_path,
+            sample_rate: decoded.sample_rate,
+            channels: decoded.channels,
+            duration_frames: decoded.duration_frames.max(1),
+        }) {
+            Ok(CommandOutcome::AudioImported(id)) => id,
+            Ok(_) => return,
+            Err(e) => {
+                self.status_message = format!("ImportAudio error: {e}");
+                return;
+            }
+        };
+
+        self.source_abs_paths
+            .insert(source_id, take.file_path.clone());
+        self.asset_manager.register(source_id, Arc::clone(&decoded));
+
+        if let Err(e) = self.project_session.execute(ProjectCommand::CreateClip {
+            track_id: take.track_id,
+            source_id,
+            name: clip_name,
+            timeline_start_frame: take.timeline_start_frame,
+            source_offset_frame: 0,
+            duration_frames: decoded.duration_frames.max(1),
+        }) {
+            self.status_message = format!("CreateClip error: {e}");
+            return;
+        }
+
+        self.rebuild_schedule();
+        self.status_message = format!(
+            "Recorded Take {} ({:.2}s, comp {:+} frames)",
+            take.take_number,
+            decoded.duration_frames as f64 / decoded.sample_rate.max(1) as f64,
+            take.applied_latency_compensation_frames
+        );
     }
 
     // ── Schedule rebuild ──────────────────────────────────────────────────────
@@ -427,6 +734,7 @@ impl EsperiaApp {
             }
         };
 
+        self.source_abs_paths.insert(source_id, item.path.clone());
         self.asset_manager.register(source_id, Arc::clone(&audio));
 
         let track_id = match item.target_track_id {
@@ -470,10 +778,26 @@ impl EsperiaApp {
         };
 
         if let Some(dir) = target_dir {
+            // Copy all imported/recorded source files into `<bundle>/Audio/`
+            // so reopening the saved project reproduces every recording & clip.
+            for source in &self.project_session.project().sources {
+                let dest = dir.join(&source.relative_path);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Some(src_abs) = self.source_abs_paths.get(&source.id)
+                    && src_abs.exists()
+                    && src_abs != &dest
+                {
+                    let _ = std::fs::copy(src_abs, &dest);
+                }
+            }
+
             match save_project(&dir, self.project_session.project()) {
                 Ok(()) => {
                     self.project_session.mark_saved();
                     self.project_bundle_dir = Some(dir.clone());
+                    self.recorder.set_output_dir(dir.join("Audio"));
                     self.status_message = format!("Saved project to {}", dir.display());
                 }
                 Err(e) => {
@@ -492,12 +816,15 @@ impl EsperiaApp {
                 Ok(report) => {
                     self.project_session = ProjectSession::new(report.project);
                     self.project_bundle_dir = Some(dir.clone());
+                    self.recorder.set_output_dir(dir.join("Audio"));
+                    self.source_abs_paths.clear();
                     self.selected_clip = None;
 
                     // Queue background decode for any sources whose files exist in bundle.
                     for source in &self.project_session.project().sources {
                         let abs = dir.join(&source.relative_path);
                         if abs.exists() {
+                            self.source_abs_paths.insert(source.id, abs.clone());
                             let _ = self.asset_manager.load_async(
                                 source.id,
                                 abs,
@@ -530,7 +857,11 @@ impl eframe::App for EsperiaApp {
 
         if let Some(err) = self.stream_errors.take() {
             self.stream_active.store(false, Ordering::Release);
-            self.status_message = format!("CPAL error: {err}");
+            self.status_message = format!("CPAL output error: {err}");
+        }
+        if let Some(err) = self.input_stream_errors.take() {
+            self.input_stream_active.store(false, Ordering::Release);
+            self.status_message = format!("CPAL input error: {err}");
         }
 
         // ── Menu bar ─────────────────────────────────────────────────────────
@@ -653,8 +984,47 @@ impl EsperiaApp {
             }
 
             if ui.button("⏹ Stop").clicked() {
-                self.engine_handle.stop();
+                if matches!(self.recorder.status(), RecordingStatus::Recording { .. }) {
+                    self.toggle_recording();
+                } else {
+                    self.engine_handle.stop();
+                }
             }
+
+            let is_recording = matches!(self.recorder.status(), RecordingStatus::Recording { .. });
+            let rec_btn = egui::Button::new(if is_recording {
+                "⏹ Stop Rec"
+            } else {
+                "⏺ Record"
+            })
+            .fill(if is_recording {
+                egui::Color32::from_rgb(200, 40, 40)
+            } else {
+                egui::Color32::from_gray(65)
+            });
+            if ui.add(rec_btn).clicked() {
+                self.toggle_recording();
+            }
+
+            let mon_btn = egui::Button::new(if self.input_monitoring {
+                "🎧 Mon ON"
+            } else {
+                "🎧 Mon"
+            })
+            .fill(if self.input_monitoring {
+                egui::Color32::from_rgb(55, 130, 190)
+            } else {
+                egui::Color32::from_gray(65)
+            });
+            if ui.add(mon_btn).clicked() {
+                self.input_monitoring = !self.input_monitoring;
+                self.recorder.set_monitoring_enabled(self.input_monitoring);
+                self.engine_handle
+                    .set_input_monitoring(self.input_monitoring);
+            }
+
+            let in_peak = self.recorder.telemetry().input_peak();
+            ui.weak(format!("In {in_peak:.2}"));
 
             ui.separator();
 
@@ -780,6 +1150,77 @@ impl EsperiaApp {
                     }
                 });
             }
+        }
+
+        ui.separator();
+        ui.heading("Audio Input & Recording");
+        ui.add_space(4.0);
+
+        let in_device_names: Vec<String> =
+            self.input_devices.iter().map(|d| d.name.clone()).collect();
+        let mut new_in_device: Option<String> = None;
+
+        egui::ComboBox::from_label("Input Device")
+            .selected_text(&self.selected_input_device_name)
+            .show_ui(ui, |ui| {
+                for name in &in_device_names {
+                    if ui
+                        .selectable_label(*name == self.selected_input_device_name, name)
+                        .clicked()
+                    {
+                        new_in_device = Some(name.clone());
+                    }
+                }
+            });
+
+        if let Some(name) = new_in_device {
+            self.switch_input_device(&name);
+        }
+
+        let max_ch = self.input_channels.max(1);
+        let mut ch_changed = false;
+        egui::ComboBox::from_label("Input Channel")
+            .selected_text(format!("Ch {} (Mono)", self.selected_input_channel + 1))
+            .show_ui(ui, |ui| {
+                for c in 0..max_ch {
+                    if ui
+                        .selectable_label(
+                            self.selected_input_channel == c,
+                            format!("Ch {} (Mono)", c + 1),
+                        )
+                        .clicked()
+                    {
+                        self.selected_input_channel = c;
+                        ch_changed = true;
+                    }
+                }
+            });
+        if ch_changed {
+            self.recorder
+                .set_channel_selection(InputChannelSelection::Mono(self.selected_input_channel));
+            self.switch_input_device(&self.selected_input_device_name.clone());
+        }
+
+        if ui
+            .checkbox(&mut self.punch_enabled, "Punch-In at Loop Region")
+            .changed()
+        {
+            self.recorder.set_punch_region(PunchRegion {
+                enabled: self.punch_enabled,
+                start_frame: self.loop_start_frame,
+                end_frame: self.loop_end_frame,
+            });
+        }
+
+        let rec_tel = self.recorder.telemetry();
+        ui.label(format!(
+            "Input: {} Hz, {}ch | Peak: {:.3}",
+            self.input_sample_rate,
+            self.input_channels,
+            rec_tel.input_peak()
+        ));
+        if !self.recorder.takes().is_empty() {
+            ui.label(format!("Recorded takes: {}", self.recorder.takes().len()));
         }
 
         ui.separator();
@@ -978,6 +1419,18 @@ impl EsperiaApp {
                                 pending_commands.push(ProjectCommand::SetTrackSolo {
                                     track_id: track.id,
                                     soloed: !track.soloed,
+                                });
+                            }
+
+                            let arm_btn = egui::Button::new("R").fill(if track.record_armed {
+                                egui::Color32::from_rgb(200, 45, 45)
+                            } else {
+                                egui::Color32::from_gray(75)
+                            });
+                            if ui.add(arm_btn).clicked() {
+                                pending_commands.push(ProjectCommand::SetTrackRecordArmed {
+                                    track_id: track.id,
+                                    armed: !track.record_armed,
                                 });
                             }
 

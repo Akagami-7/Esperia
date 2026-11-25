@@ -22,6 +22,10 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
+    #[serde(default)]
+    pub record_armed: bool,
+    #[serde(default)]
+    pub input_channel: Option<u16>,
     pub clips: Vec<Clip>,
 }
 
@@ -41,6 +45,8 @@ impl Track {
             pan: 0.0,
             muted: false,
             soloed: false,
+            record_armed: false,
+            input_channel: None,
             clips: Vec::new(),
         })
     }
