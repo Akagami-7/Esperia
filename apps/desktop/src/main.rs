@@ -12,6 +12,7 @@
 //! wires them together as the top-level coordinator.
 
 mod piano_roll;
+mod volume_glider;
 
 use eframe::egui;
 use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, MonitorRing, ScheduledClip};
@@ -37,6 +38,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use volume_glider::VolumeGlider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Timeline constants
@@ -153,6 +155,7 @@ struct EsperiaApp {
     // ── Mixer ─────────────────────────────────────────────────────────────
     mixer_meters: Option<MixerMeters>,
     show_mixer_panel: bool,
+    master_volume: VolumeGlider,
 
     // ── MIDI & Piano Roll ────────────────────────────────────────────────
     midi_ports: Vec<MidiPortInfo>,
@@ -432,6 +435,7 @@ impl EsperiaApp {
             show_device_panel: false,
             mixer_meters: None,
             show_mixer_panel: false,
+            master_volume: VolumeGlider::new(0.8),
             midi_ports,
             selected_midi_port: None,
             _midi_connection: None,
@@ -743,7 +747,13 @@ impl EsperiaApp {
 
         let buses: Vec<BusConfig> = vec![];
 
-        match MixerGraph::new(&channel_cfgs, &buses, 0.0, max_frames) {
+        let master_gain_db = if self.master_volume.value <= 0.001 {
+            -96.0
+        } else {
+            20.0 * self.master_volume.value.log10()
+        };
+
+        match MixerGraph::new(&channel_cfgs, &buses, master_gain_db, max_frames) {
             Ok(graph) => {
                 let meters = self.engine_handle.set_mixer_graph(graph);
                 self.mixer_meters = Some(meters);
@@ -1429,6 +1439,10 @@ impl EsperiaApp {
             }
             if ui.button("💾 Save").clicked() {
                 self.save_project_dialog();
+            }
+
+            if self.master_volume.ui(ui).changed() {
+                self.rebuild_mixer();
             }
 
             let mon_btn = egui::Button::new("🎧").fill(if self.input_monitoring {
