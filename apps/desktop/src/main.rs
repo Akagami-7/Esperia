@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 // Timeline constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TRACK_HEADER_WIDTH: f32 = 204.0;
+const TRACK_HEADER_WIDTH: f32 = 210.0;
 const TRACK_HEIGHT: f32 = 76.0;
 const RULER_HEIGHT: f32 = 24.0;
 const MIN_ZOOM: f32 = 0.0005; // pixels per frame
@@ -311,7 +311,8 @@ fn recorder_mon_enabled(
 }
 
 impl EsperiaApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_logic_pro_theme(&cc.egui_ctx);
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
@@ -2200,24 +2201,36 @@ impl EsperiaApp {
                 };
                 painter.rect_filled(lane_rect, 0.0, lane_bg);
 
-                // Track header background.
+                // Track header background (Logic Pro style card with blue accent stripe).
                 let header_rect = egui::Rect::from_min_size(
                     egui::pos2(rect.left(), lane_top + 1.0),
-                    egui::vec2(TRACK_HEADER_WIDTH - 4.0, TRACK_HEIGHT - 2.0),
+                    egui::vec2(TRACK_HEADER_WIDTH - 2.0, TRACK_HEIGHT - 2.0),
                 );
-                painter.rect_filled(header_rect, 4.0, egui::Color32::from_gray(54));
+                painter.rect_filled(header_rect, 2.0, egui::Color32::from_rgb(56, 56, 60));
+                painter.rect_filled(
+                    egui::Rect::from_min_size(header_rect.min, egui::vec2(4.0, header_rect.height())),
+                    0.0,
+                    egui::Color32::from_rgb(55, 135, 225),
+                );
 
                 // Interactive track header widgets using ui.put / child Ui.
-                ui.scope_builder(egui::UiBuilder::new().max_rect(header_rect.shrink(6.0)), |ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(
+                        egui::Rect::from_min_max(
+                            egui::pos2(header_rect.left() + 8.0, header_rect.top() + 5.0),
+                            egui::pos2(header_rect.right() - 6.0, header_rect.bottom() - 4.0),
+                        ),
+                    ),
+                    |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.strong(&track.name);
                         });
                         ui.horizontal(|ui| {
                             let mute_btn = egui::Button::new("M").fill(if track.muted {
-                                egui::Color32::from_rgb(200, 70, 70)
+                                egui::Color32::from_rgb(45, 130, 225)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             if ui.add(mute_btn).clicked() {
                                 pending_commands.push(ProjectCommand::SetTrackMute {
@@ -2229,7 +2242,7 @@ impl EsperiaApp {
                             let solo_btn = egui::Button::new("S").fill(if track.soloed {
                                 egui::Color32::from_rgb(210, 175, 50)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             if ui.add(solo_btn).clicked() {
                                 pending_commands.push(ProjectCommand::SetTrackSolo {
@@ -2241,7 +2254,7 @@ impl EsperiaApp {
                             let arm_btn = egui::Button::new("R").fill(if track.record_armed {
                                 egui::Color32::from_rgb(200, 45, 45)
                             } else {
-                                egui::Color32::from_gray(75)
+                                egui::Color32::from_gray(72)
                             });
                             if ui.add(arm_btn).clicked() {
                                 pending_commands.push(ProjectCommand::SetTrackRecordArmed {
@@ -2253,11 +2266,10 @@ impl EsperiaApp {
                             let mut gain = track.gain_db;
                             if ui
                                 .add(
-                                    egui::DragValue::new(&mut gain)
-                                        .range(-60.0..=6.0)
-                                        .speed(0.2)
-                                        .suffix(" dB"),
+                                    egui::Slider::new(&mut gain, -60.0..=6.0)
+                                        .show_value(false),
                                 )
+                                .on_hover_text(format!("{gain:.1} dB"))
                                 .changed()
                             {
                                 pending_commands.push(ProjectCommand::ChangeTrackGain {
@@ -2387,20 +2399,30 @@ impl EsperiaApp {
 
                 let header_rect = egui::Rect::from_min_size(
                     egui::pos2(rect.left(), lane_top + 1.0),
-                    egui::vec2(TRACK_HEADER_WIDTH - 4.0, TRACK_HEIGHT - 2.0),
+                    egui::vec2(TRACK_HEADER_WIDTH - 2.0, TRACK_HEIGHT - 2.0),
                 );
                 let is_active_midi = self.active_midi_track_id == Some(mtrack.id);
                 painter.rect_filled(
                     header_rect,
-                    4.0,
+                    2.0,
                     if is_active_midi {
-                        egui::Color32::from_rgb(48, 68, 56)
+                        egui::Color32::from_rgb(64, 68, 66)
                     } else {
-                        egui::Color32::from_gray(54)
+                        egui::Color32::from_rgb(56, 56, 60)
                     },
                 );
+                painter.rect_filled(
+                    egui::Rect::from_min_size(header_rect.min, egui::vec2(4.0, header_rect.height())),
+                    0.0,
+                    egui::Color32::from_rgb(50, 195, 90),
+                );
 
-                ui.scope_builder(egui::UiBuilder::new().max_rect(header_rect.shrink(6.0)), |ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
+                        egui::pos2(header_rect.left() + 8.0, header_rect.top() + 5.0),
+                        egui::pos2(header_rect.right() - 6.0, header_rect.bottom() - 4.0),
+                    )),
+                    |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.strong(format!("🎹 {}", mtrack.name));
@@ -2741,6 +2763,25 @@ impl EsperiaApp {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn apply_logic_pro_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = egui::Color32::from_rgb(38, 38, 40);
+    visuals.panel_fill = egui::Color32::from_rgb(42, 42, 45);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(24, 24, 26);
+    visuals.faint_bg_color = egui::Color32::from_rgb(48, 48, 52);
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(46, 46, 50);
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 28, 30));
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(64, 64, 68);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(82, 82, 88);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(40, 118, 215);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(40, 118, 215);
+    ctx.set_visuals(visuals);
+}
 
 fn db_to_linear(db: f32) -> f32 {
     if db <= -96.0 {

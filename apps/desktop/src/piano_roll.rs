@@ -14,7 +14,7 @@ use eframe::egui;
 use esperia_audio_engine::EngineHandle;
 use esperia_midi::{MidiClip, MidiMessage, PPQN, QuantizeGrid, quantize_notes, quantize_tick};
 
-const INSPECTOR_WIDTH: f32 = 204.0;
+const INSPECTOR_WIDTH: f32 = 210.0;
 const KEYBOARD_WIDTH: f32 = 46.0;
 const RULER_HEIGHT: f32 = 22.0;
 const REGION_BAR_HEIGHT: f32 = 16.0;
