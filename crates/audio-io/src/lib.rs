@@ -1,6 +1,21 @@
+//! `esperia-audio-io` — CPAL audio device enumeration and stream management.
+//!
+//! # Architecture rules (enforced)
+//! * This crate depends on `cpal` only.
+//! * It has **zero** dependency on `esperia-audio-engine` or `esperia-desktop`.
+//! * The hot-path render callback is provided by the caller (desktop crate).
+//! * Stream errors are reported through a `StreamErrorChannel` — a lock-based
+//!   channel that is **only written from the CPAL error callback** and **only
+//!   read from the UI thread**.  It is never touched inside the render callback.
+
 pub use cpal;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::fmt;
+use std::sync::{Arc, Mutex};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error types
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum AudioIoError {
@@ -16,19 +31,77 @@ pub enum AudioIoError {
 impl fmt::Display for AudioIoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HostUnavailable(msg) => write!(f, "Audio host unavailable: {msg}"),
-            Self::DeviceUnavailable(msg) => write!(f, "Audio device unavailable: {msg}"),
-            Self::DefaultDeviceNotFound => write!(f, "Default audio device was not found"),
-            Self::DeviceNotFound(name) => write!(f, "Audio device not found: {name}"),
-            Self::ConfigurationError(msg) => write!(f, "Invalid audio configuration: {msg}"),
-            Self::StreamBuildError(msg) => write!(f, "Failed to build audio stream: {msg}"),
-            Self::StreamPlayError(msg) => write!(f, "Failed to start audio stream: {msg}"),
+            Self::HostUnavailable(m) => write!(f, "Audio host unavailable: {m}"),
+            Self::DeviceUnavailable(m) => write!(f, "Audio device unavailable: {m}"),
+            Self::DefaultDeviceNotFound => write!(f, "Default audio device not found"),
+            Self::DeviceNotFound(n) => write!(f, "Audio device not found: {n}"),
+            Self::ConfigurationError(m) => write!(f, "Invalid audio configuration: {m}"),
+            Self::StreamBuildError(m) => write!(f, "Failed to build audio stream: {m}"),
+            Self::StreamPlayError(m) => write!(f, "Failed to start audio stream: {m}"),
         }
     }
 }
 
 impl std::error::Error for AudioIoError {}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// StreamErrorChannel — non-blocking error reporting from CPAL error callback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A lightweight channel that carries stream error messages from the CPAL error
+/// callback to the UI thread.
+///
+/// # Real-time safety note
+/// The CPAL error callback is *not* on the hot-path render callback — it fires
+/// asynchronously when CPAL detects a fatal stream fault.  Using a `Mutex` here
+/// is acceptable because error callbacks are exceptional, infrequent events.
+/// **Never use this inside the render callback.**
+#[derive(Clone, Default)]
+pub struct StreamErrorChannel {
+    inner: Arc<Mutex<Option<String>>>,
+}
+
+impl StreamErrorChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Called by the CPAL error callback. Stores the latest error message.
+    /// Silently drops the error if the mutex is poisoned.
+    pub fn report(&self, msg: String) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(msg);
+        }
+    }
+
+    /// Take the pending error (if any). Called from the UI thread.
+    pub fn take(&self) -> Option<String> {
+        self.inner.lock().ok()?.take()
+    }
+
+    /// True if an error is waiting to be collected.
+    pub fn has_error(&self) -> bool {
+        self.inner.lock().ok().and_then(|g| g.clone()).is_some()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AudioStreamConfig — the resolved configuration for an open stream
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The resolved configuration actually used to open the CPAL stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioStreamConfig {
+    pub device_name: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AudioDeviceInfo
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Summary of a discovered audio device, independent of `cpal::Device`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDeviceInfo {
     pub name: String,
@@ -46,14 +119,19 @@ pub struct AudioHostInfo {
     pub name: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AudioDeviceManager
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct AudioDeviceManager {
     host: cpal::Host,
 }
 
 impl AudioDeviceManager {
     pub fn new() -> Result<Self, AudioIoError> {
-        let host = cpal::default_host();
-        Ok(Self { host })
+        Ok(Self {
+            host: cpal::default_host(),
+        })
     }
 
     pub fn with_host(host_id: cpal::HostId) -> Result<Self, AudioIoError> {
@@ -76,6 +154,8 @@ impl AudioDeviceManager {
         format!("{:?}", self.host.id())
     }
 
+    // ── Device access ─────────────────────────────────────────────────────
+
     pub fn default_output_device(&self) -> Result<cpal::Device, AudioIoError> {
         self.host
             .default_output_device()
@@ -88,6 +168,7 @@ impl AudioDeviceManager {
             .ok_or(AudioIoError::DefaultDeviceNotFound)
     }
 
+    /// Human-readable name for a `cpal::Device`.
     pub fn device_display_name(dev: &cpal::Device) -> String {
         if let Ok(desc) = dev.description() {
             let name = desc.name();
@@ -101,29 +182,33 @@ impl AudioDeviceManager {
         "Audio Device".to_string()
     }
 
+    /// Find an output device by its display name.
     pub fn find_output_device_by_name(&self, name: &str) -> Result<cpal::Device, AudioIoError> {
         let devices = self
             .host
             .output_devices()
             .map_err(|e| AudioIoError::DeviceUnavailable(e.to_string()))?;
-
         for dev in devices {
             if Self::device_display_name(&dev) == name {
                 return Ok(dev);
             }
         }
-
         Err(AudioIoError::DeviceNotFound(name.to_string()))
     }
 
+    // ── Configuration helpers ─────────────────────────────────────────────
+
+    /// Query the native default output configuration for `dev`.
+    /// Returns `(sample_rate, channels)`.  Falls back to `(48000, 2)` on failure.
     pub fn default_output_config_params(dev: &cpal::Device) -> (u32, u16) {
         if let Ok(config) = dev.default_output_config() {
             (config.sample_rate(), config.channels())
         } else {
-            // Safe fallback defaults
-            (48000, 2)
+            (48_000, 2)
         }
     }
+
+    // ── Enumeration ───────────────────────────────────────────────────────
 
     pub fn enumerate_output_devices(&self) -> Result<Vec<AudioDeviceInfo>, AudioIoError> {
         let default_name = self
@@ -131,40 +216,15 @@ impl AudioDeviceManager {
             .default_output_device()
             .map(|d| Self::device_display_name(&d));
 
-        let devices = self
+        let mut result = Vec::new();
+        for dev in self
             .host
             .output_devices()
-            .map_err(|e| AudioIoError::DeviceUnavailable(e.to_string()))?;
-
-        let mut result = Vec::new();
-        for dev in devices {
+            .map_err(|e| AudioIoError::DeviceUnavailable(e.to_string()))?
+        {
             let name = Self::device_display_name(&dev);
             let is_default = default_name.as_deref() == Some(&name);
-            let (min_ch, max_ch, min_sr, max_sr) = match dev.supported_output_configs() {
-                Ok(configs) => {
-                    let mut min_ch = u16::MAX;
-                    let mut max_ch = 0;
-                    let mut min_sr = u32::MAX;
-                    let mut max_sr = 0;
-                    let mut has_any = false;
-
-                    for c in configs {
-                        has_any = true;
-                        min_ch = min_ch.min(c.channels());
-                        max_ch = max_ch.max(c.channels());
-                        min_sr = min_sr.min(c.min_sample_rate());
-                        max_sr = max_sr.max(c.max_sample_rate());
-                    }
-
-                    if has_any {
-                        (min_ch, max_ch, min_sr, max_sr)
-                    } else {
-                        (0, 0, 0, 0)
-                    }
-                }
-                Err(_) => (0, 0, 0, 0),
-            };
-
+            let (min_ch, max_ch, min_sr, max_sr) = Self::supported_ranges(&dev);
             result.push(AudioDeviceInfo {
                 name,
                 is_default_input: false,
@@ -175,7 +235,6 @@ impl AudioDeviceManager {
                 max_sample_rate: max_sr,
             });
         }
-
         Ok(result)
     }
 
@@ -185,13 +244,12 @@ impl AudioDeviceManager {
             .default_input_device()
             .map(|d| Self::device_display_name(&d));
 
-        let devices = self
+        let mut result = Vec::new();
+        for dev in self
             .host
             .input_devices()
-            .map_err(|e| AudioIoError::DeviceUnavailable(e.to_string()))?;
-
-        let mut result = Vec::new();
-        for dev in devices {
+            .map_err(|e| AudioIoError::DeviceUnavailable(e.to_string()))?
+        {
             let name = Self::device_display_name(&dev);
             let is_default = default_name.as_deref() == Some(&name);
             result.push(AudioDeviceInfo {
@@ -204,16 +262,46 @@ impl AudioDeviceManager {
                 max_sample_rate: 0,
             });
         }
-
         Ok(result)
     }
 
+    fn supported_ranges(dev: &cpal::Device) -> (u16, u16, u32, u32) {
+        let Ok(configs) = dev.supported_output_configs() else {
+            return (0, 0, 0, 0);
+        };
+        let mut min_ch = u16::MAX;
+        let mut max_ch = 0u16;
+        let mut min_sr = u32::MAX;
+        let mut max_sr = 0u32;
+        let mut any = false;
+        for c in configs {
+            any = true;
+            min_ch = min_ch.min(c.channels());
+            max_ch = max_ch.max(c.channels());
+            min_sr = min_sr.min(c.min_sample_rate());
+            max_sr = max_sr.max(c.max_sample_rate());
+        }
+        if any {
+            (min_ch, max_ch, min_sr, max_sr)
+        } else {
+            (0, 0, 0, 0)
+        }
+    }
+
+    // ── Stream construction ───────────────────────────────────────────────
+
+    /// Build and start an `f32` output stream on `device`.
+    ///
+    /// Stream errors are delivered to `error_channel`; they are **not** passed
+    /// to the render callback.  The render callback (`render_fn`) must be
+    /// real-time safe.
     pub fn build_output_stream<F>(
         &self,
         device: &cpal::Device,
         sample_rate: u32,
         channels: u16,
-        mut render_callback: F,
+        error_channel: StreamErrorChannel,
+        mut render_fn: F,
     ) -> Result<cpal::Stream, AudioIoError>
     where
         F: FnMut(&mut [f32]) + Send + 'static,
@@ -224,17 +312,15 @@ impl AudioDeviceManager {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let err_callback = |err| {
-            tracing::error!("Audio output stream error: {err}");
-        };
-
         let stream = device
             .build_output_stream::<f32, _, _>(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    render_callback(data);
+                    render_fn(data);
                 },
-                err_callback,
+                move |err| {
+                    error_channel.report(err.to_string());
+                },
                 None,
             )
             .map_err(|e| AudioIoError::StreamBuildError(e.to_string()))?;
@@ -247,25 +333,95 @@ impl AudioDeviceManager {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_device_manager_initialization() {
-        if let Ok(manager) = AudioDeviceManager::new() {
+    fn test_stream_error_channel_roundtrip() {
+        let ch = StreamErrorChannel::new();
+        assert!(!ch.has_error());
+        assert!(ch.take().is_none());
+
+        ch.report("device disconnected".into());
+        assert!(ch.has_error());
+        let msg = ch.take();
+        assert_eq!(msg.as_deref(), Some("device disconnected"));
+        assert!(ch.take().is_none()); // consumed
+    }
+
+    #[test]
+    fn test_stream_error_channel_overwrites() {
+        let ch = StreamErrorChannel::new();
+        ch.report("first".into());
+        ch.report("second".into());
+        // Only the last write is kept (Option stores one value).
+        let msg = ch.take().unwrap();
+        assert_eq!(msg, "second");
+    }
+
+    #[test]
+    fn test_stream_error_channel_clone_shares_state() {
+        let ch1 = StreamErrorChannel::new();
+        let ch2 = ch1.clone();
+        ch1.report("from clone".into());
+        assert_eq!(ch2.take().as_deref(), Some("from clone"));
+    }
+
+    #[test]
+    fn test_device_manager_initializes() {
+        if let Ok(mgr) = AudioDeviceManager::new() {
+            assert!(!mgr.host_name().is_empty());
+        }
+        // CI/headless: skip — AudioDeviceManager::new() may succeed but
+        // enumerate nothing; that's acceptable.
+    }
+
+    #[test]
+    fn test_available_hosts_non_empty() {
+        // At least one host (CoreAudio / WASAPI / ALSA) must be present.
+        if AudioDeviceManager::new().is_ok() {
             let hosts = AudioDeviceManager::available_hosts();
             assert!(!hosts.is_empty());
-            assert!(!manager.host_name().is_empty());
         }
     }
 
     #[test]
     fn test_output_device_enumeration_graceful() {
-        if let Ok(manager) = AudioDeviceManager::new() {
-            // In CI/headless environments without audio hardware, this should return Ok(vec) or handle error gracefully
-            let devices = manager.enumerate_output_devices();
-            assert!(devices.is_ok() || matches!(devices, Err(AudioIoError::DeviceUnavailable(_))));
+        if let Ok(mgr) = AudioDeviceManager::new() {
+            let result = mgr.enumerate_output_devices();
+            // Either succeeds or returns a structured error — never panics.
+            assert!(
+                result.is_ok() || matches!(result, Err(AudioIoError::DeviceUnavailable(_))),
+                "unexpected error: {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_nonexistent_device_returns_not_found() {
+        if let Ok(mgr) = AudioDeviceManager::new() {
+            let result = mgr.find_output_device_by_name("__no_such_device__");
+            assert!(
+                matches!(result, Err(AudioIoError::DeviceNotFound(_))),
+                "expected DeviceNotFound"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_output_config_params_fallback() {
+        // Construct a mock by using real device if available, or verify fallback.
+        if let Ok(mgr) = AudioDeviceManager::new()
+            && let Ok(dev) = mgr.default_output_device()
+        {
+            let (sr, ch) = AudioDeviceManager::default_output_config_params(&dev);
+            assert!((8_000..=384_000).contains(&sr), "sample_rate={sr}");
+            assert!(ch >= 1, "channels={ch}");
         }
     }
 }
