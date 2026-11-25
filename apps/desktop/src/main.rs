@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 // Timeline constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TRACK_HEADER_WIDTH: f32 = 176.0;
+const TRACK_HEADER_WIDTH: f32 = 204.0;
 const TRACK_HEIGHT: f32 = 76.0;
 const RULER_HEIGHT: f32 = 24.0;
 const MIN_ZOOM: f32 = 0.0005; // pixels per frame
@@ -816,6 +816,7 @@ impl EsperiaApp {
             self.active_midi_track_id = Some(track_id);
             self.active_midi_clip_id = Some(cid);
             self.show_piano_roll = true;
+            self.piano_roll_state.scroll_to_tick(start_tick);
             self.status_message = format!("Created MIDI region Pattern {pat_idx}");
         }
         self.rebuild_midi_schedule();
@@ -1208,15 +1209,14 @@ impl eframe::App for EsperiaApp {
 
         // ── Piano Roll panel (collapsible & resizable bottom editor) ──────────
         if self.show_piano_roll {
-            let panel_resp = egui::Panel::bottom("piano_roll_panel")
-                .resizable(true)
-                .default_size(self.piano_roll_height)
-                .min_size(180.0)
-                .max_size(680.0)
+            let max_h = (ui.available_height() - 120.0).max(220.0);
+            self.piano_roll_height = self.piano_roll_height.clamp(180.0, max_h);
+            egui::Panel::bottom("piano_roll_panel")
+                .resizable(false)
+                .exact_size(self.piano_roll_height)
                 .show(ui, |ui| {
-                    self.draw_piano_roll_panel(ui);
+                    self.draw_piano_roll_panel(ui, max_h);
                 });
-            self.piano_roll_height = panel_resp.response.rect.height();
         }
 
         // ── Main timeline area ────────────────────────────────────────────────
@@ -1232,70 +1232,103 @@ impl eframe::App for EsperiaApp {
 
 impl EsperiaApp {
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let is_playing = self.engine_handle.is_playing();
-            let transport_state = self.engine_handle.telemetry.transport_state();
+        let ph = self.engine_handle.playhead_frame();
+        let sr_u32 = self.active_sample_rate.max(1);
+        let tempo_map = &self.project_session.project().tempo_map;
+        let ph_tick = tempo_map.sample_to_tick(ph, sr_u32);
+        let (bar, beat, _) = esperia_midi::TempoMap::tick_to_bar_beat_tick(
+            ph_tick,
+            esperia_midi::TimeSignature::default(),
+        );
+        let mut tempo_bpm = self.project_session.project().timeline.tempo_bpm;
 
-            let play_label = if transport_state == 1 {
-                "⏸ Pause"
+        ui.horizontal(|ui| {
+            // ── Left: Panel & Track creation shortcuts ────────────────────────
+            let pr_btn = egui::Button::new("🎹 Piano Roll").fill(if self.show_piano_roll {
+                egui::Color32::from_rgb(35, 115, 210)
             } else {
-                "▶ Play"
-            };
-            if ui.button(play_label).clicked() {
+                egui::Color32::from_gray(58)
+            });
+            if ui.add(pr_btn).clicked() {
+                self.show_piano_roll = !self.show_piano_roll;
+            }
+
+            let mix_btn = egui::Button::new("🎚 Mixer").fill(if self.show_mixer_panel {
+                egui::Color32::from_rgb(35, 115, 210)
+            } else {
+                egui::Color32::from_gray(58)
+            });
+            if ui.add(mix_btn).clicked() {
+                self.show_mixer_panel = !self.show_mixer_panel;
+                if self.show_mixer_panel {
+                    self.rebuild_mixer();
+                }
+            }
+
+            let dev_btn = egui::Button::new("⚙ Devices").fill(if self.show_device_panel {
+                egui::Color32::from_rgb(35, 115, 210)
+            } else {
+                egui::Color32::from_gray(58)
+            });
+            if ui.add(dev_btn).clicked() {
+                self.show_device_panel = !self.show_device_panel;
+            }
+
+            ui.separator();
+
+            // ── Transport controls ────────────────────────────────────────────
+            if ui.button("⏮").on_hover_text("Return to Bar 1").clicked() {
+                self.engine_handle.seek(0);
+            }
+
+            let transport_state = self.engine_handle.telemetry.transport_state();
+            let play_label = if transport_state == 1 { "⏸" } else { "▶" };
+            let play_btn = egui::Button::new(play_label).fill(if transport_state == 1 {
+                egui::Color32::from_rgb(45, 150, 75)
+            } else {
+                egui::Color32::from_gray(62)
+            });
+            if ui.add(play_btn).clicked() {
                 self.engine_handle.toggle_play();
             }
 
-            if ui.button("⏹ Stop").clicked() {
+            if ui.button("⏹").on_hover_text("Stop").clicked() {
                 if matches!(self.recorder.status(), RecordingStatus::Recording { .. }) {
                     self.toggle_recording();
+                } else if self.midi_recorder.is_recording() {
+                    self.toggle_midi_recording();
                 } else {
                     self.engine_handle.stop();
                 }
             }
 
-            let is_recording = matches!(self.recorder.status(), RecordingStatus::Recording { .. });
-            let rec_btn = egui::Button::new(if is_recording {
-                "⏹ Stop Rec"
+            let is_recording = matches!(self.recorder.status(), RecordingStatus::Recording { .. })
+                || self.midi_recorder.is_recording();
+            let rec_btn = egui::Button::new("⏺").fill(if is_recording {
+                egui::Color32::from_rgb(205, 45, 45)
             } else {
-                "⏺ Record"
-            })
-            .fill(if is_recording {
-                egui::Color32::from_rgb(200, 40, 40)
-            } else {
-                egui::Color32::from_gray(65)
+                egui::Color32::from_gray(62)
             });
-            if ui.add(rec_btn).clicked() {
-                self.toggle_recording();
+            if ui
+                .add(rec_btn)
+                .on_hover_text("Record MIDI (when MIDI track selected) or Audio")
+                .clicked()
+            {
+                if self.active_midi_track_id.is_some()
+                    && !self.project_session.project().midi_tracks.is_empty()
+                {
+                    self.toggle_midi_recording();
+                } else {
+                    self.toggle_recording();
+                }
             }
 
-            let mon_btn = egui::Button::new(if self.input_monitoring {
-                "🎧 Mon ON"
+            let loop_btn = egui::Button::new("⟳").fill(if self.loop_enabled {
+                egui::Color32::from_rgb(205, 155, 35)
             } else {
-                "🎧 Mon"
-            })
-            .fill(if self.input_monitoring {
-                egui::Color32::from_rgb(55, 130, 190)
-            } else {
-                egui::Color32::from_gray(65)
+                egui::Color32::from_gray(62)
             });
-            if ui.add(mon_btn).clicked() {
-                self.input_monitoring = !self.input_monitoring;
-                self.recorder.set_monitoring_enabled(self.input_monitoring);
-                self.engine_handle
-                    .set_input_monitoring(self.input_monitoring);
-            }
-
-            let in_peak = self.recorder.telemetry().input_peak();
-            ui.weak(format!("In {in_peak:.2}"));
-
-            ui.separator();
-
-            let loop_text = if self.loop_enabled {
-                "⟳ Loop ON"
-            } else {
-                "⟳ Loop OFF"
-            };
-            if ui.button(loop_text).clicked() {
+            if ui.add(loop_btn).on_hover_text("Cycle / Loop").clicked() {
                 self.loop_enabled = !self.loop_enabled;
                 self.engine_handle.enable_loop(self.loop_enabled);
                 if self.loop_enabled {
@@ -1306,22 +1339,100 @@ impl EsperiaApp {
 
             ui.separator();
 
-            let ph = self.engine_handle.playhead_frame();
-            let sr = self.active_sample_rate.max(1) as f64;
-            let ph_secs = ph as f64 / sr;
-            ui.monospace(format!(
-                "{:02}:{:02}.{:03}",
-                ph_secs as u64 / 60,
-                ph_secs as u64 % 60,
-                ((ph_secs * 1000.0) as u64 % 1000)
-            ));
+            // ── Logic Pro Style Center LCD Display ────────────────────────────
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(28, 30, 34))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(68)))
+                .corner_radius(5.0)
+                .inner_margin(egui::Margin::symmetric(10, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{bar}.{beat}"))
+                                    .monospace()
+                                    .size(16.0)
+                                    .color(egui::Color32::from_gray(240)),
+                            );
+                            ui.label(
+                                egui::RichText::new("BAR   BEAT")
+                                    .size(8.5)
+                                    .color(egui::Color32::from_gray(145)),
+                            );
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut tempo_bpm)
+                                        .range(40.0..=240.0)
+                                        .speed(0.5)
+                                        .max_decimals(0),
+                                )
+                                .changed()
+                            {
+                                let proj = self.project_session.project_mut();
+                                proj.timeline.tempo_bpm = tempo_bpm;
+                                proj.tempo_map = esperia_midi::TempoMap::constant(tempo_bpm);
+                                self.rebuild_midi_schedule();
+                            }
+                            ui.label(
+                                egui::RichText::new("TEMPO")
+                                    .size(8.5)
+                                    .color(egui::Color32::from_gray(145)),
+                            );
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("4/4")
+                                    .monospace()
+                                    .size(13.0)
+                                    .color(egui::Color32::from_gray(225)),
+                            );
+                            ui.label(
+                                egui::RichText::new("SIG")
+                                    .size(8.5)
+                                    .color(egui::Color32::from_gray(145)),
+                            );
+                        });
+                    });
+                });
 
             ui.separator();
 
-            let tempo = self.project_session.project().timeline.tempo_bpm;
-            ui.label(format!("{tempo:.0} BPM"));
+            // ── Right: Track / Import / Save / DSP ────────────────────────────
+            if ui.button("+ Audio").clicked() {
+                let idx = self.project_session.project().tracks.len() + 1;
+                let _ = self.project_session.execute(ProjectCommand::AddTrack {
+                    name: format!("Track {idx}"),
+                });
+            }
+            if ui.button("+ MIDI").clicked() {
+                self.add_midi_track();
+            }
+            if ui.button("📂 Import").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["wav", "wave"])
+                    .pick_file()
+            {
+                self.import_audio_file(path, None);
+            }
+            if ui.button("💾 Save").clicked() {
+                self.save_project_dialog();
+            }
 
-            ui.separator();
+            let mon_btn = egui::Button::new("🎧").fill(if self.input_monitoring {
+                egui::Color32::from_rgb(55, 130, 190)
+            } else {
+                egui::Color32::from_gray(58)
+            });
+            if ui.add(mon_btn).on_hover_text("Input Monitoring").clicked() {
+                self.input_monitoring = !self.input_monitoring;
+                self.recorder.set_monitoring_enabled(self.input_monitoring);
+                self.engine_handle
+                    .set_input_monitoring(self.input_monitoring);
+            }
 
             let bf = self.buffer_frames_hint.load(Ordering::Relaxed);
             let load = self
@@ -1335,100 +1446,33 @@ impl EsperiaApp {
             } else {
                 egui::Color32::from_rgb(80, 220, 100)
             };
-            ui.colored_label(load_color, format!("DSP {:.1}%", load * 100.0));
-
-            ui.separator();
-
-            let peak = self.engine_handle.telemetry.peak();
-            if is_playing {
-                ui.colored_label(
-                    egui::Color32::from_rgb(80, 220, 100),
-                    format!("● peak {peak:.3}"),
-                );
-            } else {
-                ui.colored_label(egui::Color32::GRAY, "○ stopped");
-            }
-
-            ui.separator();
-
-            if ui.button("📂 Import Audio").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["wav", "wave"])
-                    .pick_file()
-            {
-                self.import_audio_file(path, None);
-            }
-
-            if ui.button("➕ Track").clicked() {
-                let idx = self.project_session.project().tracks.len() + 1;
-                let _ = self.project_session.execute(ProjectCommand::AddTrack {
-                    name: format!("Track {idx}"),
-                });
-            }
-
-            if ui.button("🎹 +MIDI").clicked() {
-                self.add_midi_track();
-            }
-
-            let midi_rec = self.midi_recorder.is_recording();
-            let midi_rec_btn = egui::Button::new(if midi_rec {
-                "⏹ Stop MIDI"
-            } else {
-                "⏺ Rec MIDI"
-            })
-            .fill(if midi_rec {
-                egui::Color32::from_rgb(200, 60, 40)
-            } else {
-                egui::Color32::from_gray(65)
-            });
-            if ui.add(midi_rec_btn).clicked() {
-                self.toggle_midi_recording();
-            }
-
-            let pr_btn = egui::Button::new(if self.show_piano_roll {
-                "🎹 Piano Roll ON"
-            } else {
-                "🎹 Piano Roll"
-            })
-            .fill(if self.show_piano_roll {
-                egui::Color32::from_rgb(55, 130, 190)
-            } else {
-                egui::Color32::from_gray(65)
-            });
-            if ui.add(pr_btn).clicked() {
-                self.show_piano_roll = !self.show_piano_roll;
-            }
-
-            if ui.button("💾 Save").clicked() {
-                self.save_project_dialog();
-            }
-
-            ui.separator();
-
-            let mix_btn_text = if self.show_mixer_panel {
-                "🎚 Mixer ON"
-            } else {
-                "🎚 Mixer"
-            };
-            if ui
-                .add(
-                    egui::Button::new(mix_btn_text).fill(if self.show_mixer_panel {
-                        egui::Color32::from_rgb(55, 130, 190)
-                    } else {
-                        egui::Color32::from_gray(65)
-                    }),
-                )
-                .clicked()
-            {
-                self.show_mixer_panel = !self.show_mixer_panel;
-                if self.show_mixer_panel {
-                    self.rebuild_mixer();
-                }
-            }
+            ui.colored_label(load_color, format!("DSP {:.0}%", load * 100.0));
         });
     }
 
-    fn draw_piano_roll_panel(&mut self, ui: &mut egui::Ui) {
+    fn draw_piano_roll_panel(&mut self, ui: &mut egui::Ui, max_h: f32) {
+        // ── Draggable top splitter bar (always works to expand/shrink) ────────
+        let (split_rect, split_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(100.0), 6.0),
+            egui::Sense::drag(),
+        );
+        if split_resp.hovered() || split_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if split_resp.dragged() {
+            self.piano_roll_height =
+                (self.piano_roll_height - split_resp.drag_delta().y).clamp(180.0, max_h);
+        }
+        ui.painter().rect_filled(
+            split_rect,
+            0.0,
+            if split_resp.hovered() || split_resp.dragged() {
+                egui::Color32::from_rgb(70, 145, 225)
+            } else {
+                egui::Color32::from_gray(55)
+            },
+        );
+
         if self.project_session.project().midi_tracks.is_empty() {
             ui.horizontal(|ui| {
                 ui.label("No MIDI tracks yet.");
@@ -1439,7 +1483,7 @@ impl EsperiaApp {
             return;
         }
 
-        // Track / clip / instrument selector bar
+        // Track / clip / instrument / size selector bar
         let track_options: Vec<(u64, String, InstrumentKind)> = self
             .project_session
             .project()
@@ -1476,7 +1520,6 @@ impl EsperiaApp {
                     }
                 });
 
-            // Instrument preset selector for the active MIDI track
             if let Some((_, _, current_inst)) =
                 track_options.iter().find(|(id, _, _)| *id == active_tid)
             {
@@ -1513,8 +1556,21 @@ impl EsperiaApp {
             }
 
             ui.separator();
-            ui.label("Panel Height:");
-            ui.add(egui::Slider::new(&mut self.piano_roll_height, 180.0..=640.0).show_value(false));
+            ui.strong("Piano Roll");
+            ui.separator();
+            ui.label("Height:");
+            ui.add(egui::Slider::new(&mut self.piano_roll_height, 180.0..=max_h).show_value(false));
+            let is_expanded = self.piano_roll_height >= max_h - 40.0;
+            if ui
+                .button(if is_expanded {
+                    "⤡ Restore"
+                } else {
+                    "⤢ Expand"
+                })
+                .clicked()
+            {
+                self.piano_roll_height = if is_expanded { 300.0 } else { max_h };
+            }
         });
 
         let active_tid = self.active_midi_track_id.unwrap_or(0);
@@ -1528,23 +1584,59 @@ impl EsperiaApp {
                 .and_then(|t| t.clips.first().map(|c| c.id));
         }
 
+        let mut new_pattern_start: Option<u64> = None;
+        let mut duplicate_clip: Option<MidiClip> = None;
+        let mut seek_frame: Option<u64> = None;
+
         if let Some(active_cid) = self.active_midi_clip_id {
             let engine_handle = self.engine_handle.clone();
             let playhead_frame = engine_handle.playhead_frame();
             let sr = self.active_sample_rate;
             let pr_state = &mut self.piano_roll_state;
             let proj = self.project_session.project_mut();
-            let playhead_tick = proj.tempo_map.sample_to_tick(playhead_frame, sr);
+            let tempo_map = proj.tempo_map.clone();
+            let playhead_tick = tempo_map.sample_to_tick(playhead_frame, sr);
             if let Some(track) = proj.midi_tracks.iter_mut().find(|t| t.id == active_tid) {
+                let tname = track.name.clone();
                 let ch = track.channel;
-                if let Some(clip) = track.find_clip_mut(active_cid)
-                    && pr_state.draw(ui, clip, ch, playhead_tick, &engine_handle)
-                {
-                    schedule_dirty = true;
+                if let Some(clip) = track.find_clip_mut(active_cid) {
+                    let outcome =
+                        pr_state.draw(ui, clip, &tname, ch, playhead_tick, &engine_handle);
+                    if outcome.clip_modified {
+                        schedule_dirty = true;
+                    }
+                    if let Some(st) = outcome.seek_tick {
+                        seek_frame = Some(tempo_map.tick_to_sample(st, sr));
+                    }
+                    if outcome.create_new_pattern {
+                        new_pattern_start = Some(clip.start_tick.saturating_add(clip.length_ticks));
+                    }
+                    if outcome.duplicate_pattern {
+                        let mut dup = clip.clone();
+                        dup.start_tick = clip.start_tick.saturating_add(clip.length_ticks);
+                        dup.name = format!("{} Copy", clip.name);
+                        duplicate_clip = Some(dup);
+                    }
                 }
             }
         }
 
+        if let Some(st) = new_pattern_start {
+            self.create_midi_region(active_tid, st);
+        }
+        if let Some(mut dup) = duplicate_clip {
+            let proj = self.project_session.project_mut();
+            dup.id = proj.allocate_id();
+            let new_cid = dup.id;
+            if let Some(track) = proj.midi_tracks.iter_mut().find(|t| t.id == active_tid) {
+                track.clips.push(dup);
+                self.active_midi_clip_id = Some(new_cid);
+                schedule_dirty = true;
+            }
+        }
+        if let Some(f) = seek_frame {
+            self.engine_handle.seek(f);
+        }
         if schedule_dirty {
             self.rebuild_midi_schedule();
         }
@@ -2021,42 +2113,62 @@ impl EsperiaApp {
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(28));
 
-            // ── Time ruler ────────────────────────────────────────────────────
+            // ── Time ruler (Bars & Beats synced with LCD & Piano Roll) ──────
             let ruler_rect =
                 egui::Rect::from_min_size(rect.min, egui::vec2(content_width, RULER_HEIGHT));
-            painter.rect_filled(ruler_rect, 0.0, egui::Color32::from_gray(44));
+            painter.rect_filled(ruler_rect, 0.0, egui::Color32::from_rgb(40, 40, 42));
 
             let frames_per_px = 1.0 / self.timeline_zoom;
-            let px_per_sec = sr as f32 * self.timeline_zoom;
-            let marker_step_secs = if px_per_sec > 200.0 {
-                0.25
-            } else if px_per_sec > 60.0 {
-                1.0
-            } else if px_per_sec > 15.0 {
-                5.0
+            let bar_ticks = PPQN * 4;
+            let samples_per_bar = tempo_map.tick_to_sample(bar_ticks, sr_u32).max(1) as f32;
+            let px_per_bar = samples_per_bar * self.timeline_zoom;
+            let bar_step = if px_per_bar > 52.0 {
+                1u64
+            } else if px_per_bar > 24.0 {
+                2
+            } else if px_per_bar > 10.0 {
+                4
             } else {
-                15.0
+                8
             };
-            let frames_per_marker = ((marker_step_secs * sr as f32) as u64).max(1);
-            let mut marker_frame = 0u64;
-            while marker_frame <= total_frames {
-                let x = lane_x_start + marker_frame as f32 * self.timeline_zoom;
-                painter.line_segment(
-                    [
-                        egui::pos2(x, rect.top() + RULER_HEIGHT - 8.0),
-                        egui::pos2(x, rect.top() + RULER_HEIGHT),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
-                );
-                let secs = marker_frame as f64 / sr;
-                painter.text(
-                    egui::pos2(x + 3.0, rect.top() + 4.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{secs:.1}s"),
-                    egui::FontId::monospace(10.0),
-                    egui::Color32::from_gray(185),
-                );
-                marker_frame += frames_per_marker;
+            let max_tick = tempo_map.sample_to_tick(total_frames, sr_u32);
+            let mut tick_cursor = 0u64;
+            let mut bar_num = 1u64;
+            while tick_cursor <= max_tick {
+                let mf = tempo_map.tick_to_sample(tick_cursor, sr_u32);
+                let x = lane_x_start + mf as f32 * self.timeline_zoom;
+                if bar_num.saturating_sub(1).is_multiple_of(bar_step) {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, rect.top() + RULER_HEIGHT - 10.0),
+                            egui::pos2(x, rect.top() + RULER_HEIGHT),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(145)),
+                    );
+                    painter.text(
+                        egui::pos2(x + 3.0, rect.top() + 3.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{bar_num}"),
+                        egui::FontId::monospace(10.0),
+                        egui::Color32::from_gray(195),
+                    );
+                }
+                // Beat sub-ticks when zoomed in
+                if bar_step == 1 && px_per_bar > 64.0 {
+                    for b in 1..4u64 {
+                        let bf = tempo_map.tick_to_sample(tick_cursor + b * PPQN, sr_u32);
+                        let bx = lane_x_start + bf as f32 * self.timeline_zoom;
+                        painter.line_segment(
+                            [
+                                egui::pos2(bx, rect.top() + RULER_HEIGHT - 5.0),
+                                egui::pos2(bx, rect.top() + RULER_HEIGHT),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                        );
+                    }
+                }
+                tick_cursor = tick_cursor.saturating_add(bar_ticks);
+                bar_num += 1;
             }
 
             // ── Loop region shading ───────────────────────────────────────────
@@ -2411,6 +2523,7 @@ impl EsperiaApp {
                         self.active_midi_track_id = Some(mtrack.id);
                         self.active_midi_clip_id = Some(clip.id);
                         self.show_piano_roll = true;
+                        self.piano_roll_state.scroll_to_tick(clip.start_tick);
                     }
                 }
 
