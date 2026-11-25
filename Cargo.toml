@@ -6,6 +6,7 @@ members = [
     "crates/project-model",
     "crates/media",
     "crates/recording",
+    "crates/mixer",
 ]
 default-members = [
     "apps/desktop",

@@ -14,6 +14,7 @@
 //! * `ScheduledClip` holds an `Arc<DecodedSamples>` (a type-alias for
 //!   `Arc<Vec<f32>>`) so the callback can read decoded audio without allocation.
 
+use esperia_mixer::{MixerGraph, MixerMeters};
 use std::cell::UnsafeCell;
 use std::f32::consts::TAU;
 use std::sync::Arc;
@@ -270,6 +271,8 @@ impl<const N: usize> CommandRing<N> {
 pub struct ScheduledClip {
     /// Unique clip identifier (opaque u64 — maps to `ClipId`'s inner UUID low bits).
     pub clip_id: u64,
+    /// Track / mixer channel ID that this clip routes into.
+    pub track_id: u64,
     /// Frame at which this clip starts on the timeline.
     pub timeline_start_frame: u64,
     /// First frame within the source audio to play (for trimmed clips).
@@ -491,6 +494,10 @@ pub struct EngineHandle {
     pub telemetry: Arc<EngineTelemetry>,
     /// Lock-free pointer to the current `ClipSchedule`.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Lock-free pointer for pushing a newly-built `MixerGraph` to the audio thread.
+    pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
+    /// Lock-free pointer for returning a retired `MixerGraph` to the UI thread for drop.
+    retired_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Lock-free ring for live input monitoring (written by input callback).
     monitor_ring: Arc<MonitorRing>,
 }
@@ -580,6 +587,30 @@ impl EngineHandle {
         }
     }
 
+    /// Replace the mixer routing graph lock-free.
+    ///
+    /// Returns the `MixerMeters` snapshot for reading channel, bus, and master
+    /// peak/RMS/clip values from the UI thread. Any previously retired graph
+    /// is reclaimed and dropped on the UI thread (never on the audio thread).
+    pub fn set_mixer_graph(&self, graph: MixerGraph) -> MixerMeters {
+        let meters = graph.meters();
+        // Reclaim any graph retired by the audio thread first.
+        let retired = self
+            .retired_mixer_ptr
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            let _ = unsafe { Box::from_raw(retired) };
+        }
+
+        let new_raw = Box::into_raw(Box::new(graph));
+        let prev_pending = self.pending_mixer_ptr.swap(new_raw, Ordering::AcqRel);
+        if !prev_pending.is_null() {
+            // Audio thread hadn't picked up the previous pending graph yet; drop it here.
+            let _ = unsafe { Box::from_raw(prev_pending) };
+        }
+        meters
+    }
+
     /// Return the current playhead position in frames.
     pub fn playhead_frame(&self) -> u64 {
         self.telemetry.playhead_frame.load(Ordering::Acquire)
@@ -597,6 +628,22 @@ impl Drop for EngineHandle {
                 .swap(std::ptr::null_mut(), Ordering::AcqRel);
             if !raw.is_null() {
                 let _ = unsafe { Arc::from_raw(raw as *const ClipSchedule) };
+            }
+        }
+        if Arc::strong_count(&self.pending_mixer_ptr) == 1 {
+            let raw = self
+                .pending_mixer_ptr
+                .swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !raw.is_null() {
+                let _ = unsafe { Box::from_raw(raw) };
+            }
+        }
+        if Arc::strong_count(&self.retired_mixer_ptr) == 1 {
+            let raw = self
+                .retired_mixer_ptr
+                .swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !raw.is_null() {
+                let _ = unsafe { Box::from_raw(raw) };
             }
         }
     }
@@ -627,6 +674,10 @@ pub struct AudioEngine {
     input_monitoring_enabled: bool,
     /// Shared pointer to the current clip schedule.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Active mixer routing graph (owned exclusively by audio thread).
+    mixer: Option<MixerGraph>,
+    pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
+    retired_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Preallocated SPSC ring for live input monitoring.
     monitor_ring: Arc<MonitorRing>,
     /// Preallocated scratch buffer for draining monitor samples.
@@ -641,12 +692,16 @@ impl AudioEngine {
         let commands = Arc::new(CommandRing::<64>::new());
         let telemetry = Arc::new(EngineTelemetry::new());
         let schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let pending_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let retired_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let monitor_ring = Arc::new(MonitorRing::new(16_384));
 
         let handle = EngineHandle {
             commands: Arc::clone(&commands),
             telemetry: Arc::clone(&telemetry),
             schedule_ptr: Arc::clone(&schedule_ptr),
+            pending_mixer_ptr: Arc::clone(&pending_mixer_ptr),
+            retired_mixer_ptr: Arc::clone(&retired_mixer_ptr),
             monitor_ring: Arc::clone(&monitor_ring),
         };
 
@@ -668,6 +723,9 @@ impl AudioEngine {
             loop_enabled: false,
             input_monitoring_enabled: false,
             schedule_ptr,
+            mixer: None,
+            pending_mixer_ptr,
+            retired_mixer_ptr,
             monitor_ring,
             monitor_scratch,
         };
@@ -756,6 +814,18 @@ impl AudioEngine {
             }
         }
 
+        // ── swap pending mixer graph if UI published a new one ─────────────
+        let incoming_mixer = self
+            .pending_mixer_ptr
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !incoming_mixer.is_null() {
+            let new_mixer = unsafe { *Box::from_raw(incoming_mixer) };
+            if let Some(old_mixer) = self.mixer.replace(new_mixer) {
+                let old_raw = Box::into_raw(Box::new(old_mixer));
+                let _ = self.retired_mixer_ptr.swap(old_raw, Ordering::AcqRel);
+            }
+        }
+
         // ── render audio ───────────────────────────────────────────────────
         let ch = self.channels;
         let frames = output.len() / ch.max(1);
@@ -785,12 +855,22 @@ impl AudioEngine {
             if let Some(schedule) = schedule_opt
                 && !schedule.clips.is_empty()
             {
-                // When clips exist, silence the generator contribution so we
-                // only hear the actual audio.
                 output.fill(0.0);
 
-                for clip in &schedule.clips {
-                    mix_clip(clip, output, frames, ch, self.playhead_frame);
+                if let Some(ref mut mixer) = self.mixer {
+                    mixer.clear_buffers(frames);
+                    for clip in &schedule.clips {
+                        if let Some(ch_buf) = mixer.channel_input_mut(clip.track_id, frames) {
+                            mix_clip_stereo(clip, ch_buf, frames, self.playhead_frame);
+                        } else {
+                            mix_clip(clip, output, frames, ch, self.playhead_frame);
+                        }
+                    }
+                    mixer.process(frames, ch, output);
+                } else {
+                    for clip in &schedule.clips {
+                        mix_clip(clip, output, frames, ch, self.playhead_frame);
+                    }
                 }
             }
 
@@ -871,6 +951,17 @@ impl AudioEngine {
 // ─────────────────────────────────────────────────────────────────────────────
 // Clip mixing helper (called from process — real-time safe)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Mix `clip` into an interleaved stereo channel buffer (`out_channels == 2`).
+#[inline]
+fn mix_clip_stereo(
+    clip: &ScheduledClip,
+    stereo_output: &mut [f32],
+    frames: usize,
+    playhead_frame: u64,
+) {
+    mix_clip(clip, stereo_output, frames, 2, playhead_frame);
+}
 
 /// Mix `clip` into `output` for the current block starting at `playhead_frame`.
 ///
@@ -1287,6 +1378,7 @@ mod tests {
         let samples = Arc::new(vec![0.5f32; 128]); // 128 mono frames
         let clip = ScheduledClip {
             clip_id: 1,
+            track_id: 1,
             timeline_start_frame: 0,
             source_offset_frame: 0,
             duration_frames: 128,
@@ -1315,6 +1407,7 @@ mod tests {
         let samples = Arc::new(vec![1.0f32; 64]);
         let clip = ScheduledClip {
             clip_id: 2,
+            track_id: 1,
             timeline_start_frame: 64,
             source_offset_frame: 0,
             duration_frames: 64,

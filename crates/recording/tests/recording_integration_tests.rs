@@ -113,6 +113,7 @@ fn record_save_reopen_and_playback_roundtrip() {
     let schedule = Arc::new(ClipSchedule {
         clips: vec![ScheduledClip {
             clip_id: loaded_clip.id.0,
+            track_id: loaded.project.tracks[0].id.0,
             timeline_start_frame: loaded_clip.timeline_start_frame,
             source_offset_frame: loaded_clip.source_offset_frame,
             duration_frames: loaded_clip.duration_frames,
