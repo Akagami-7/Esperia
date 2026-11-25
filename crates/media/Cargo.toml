@@ -1,0 +1,15 @@
+[package]
+name = "esperia-media"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Audio decoding — WAV (pcm codec required), FLAC, MP3 etc. can be enabled later.
+symphonia = { version = "0.5", features = ["wav", "pcm"] }
+esperia-project-model = { path = "../project-model" }
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+hound = "3.5"
+esperia-audio-engine = { path = "../audio-engine" }
