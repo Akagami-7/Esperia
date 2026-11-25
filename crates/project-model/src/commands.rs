@@ -128,6 +128,13 @@ impl ProjectSession {
         &self.project
     }
 
+    /// Mutable access to the current project state (marks session dirty).
+    pub fn project_mut(&mut self) -> &mut Project {
+        self.dirty = true;
+        self.project.touch();
+        &mut self.project
+    }
+
     /// Whether the project has unsaved modifications.
     pub fn is_dirty(&self) -> bool {
         self.dirty
