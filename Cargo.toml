@@ -3,6 +3,7 @@ members = [
     "apps/desktop",
     "crates/audio-io",
     "crates/audio-engine",
+    "crates/project-model", "crates/media",
 ]
 default-members = [
     "apps/desktop",
