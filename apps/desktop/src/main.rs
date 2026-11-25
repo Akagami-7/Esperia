@@ -381,14 +381,22 @@ impl EsperiaApp {
             (None, 48_000, 1)
         };
 
-        let project = Project::new("Untitled".to_string(), active_sr, 120.0)
+        let mut project = Project::new("Untitled".to_string(), active_sr, 120.0)
             .expect("default project parameters are valid");
+        let default_tid = project.allocate_id();
+        let default_cid = project.allocate_id();
+        let mut default_midi = MidiTrack::new(default_tid, "MIDI 1");
+        default_midi
+            .clips
+            .push(MidiClip::new(default_cid, "Pattern 1", 0, PPQN * 4));
+        project.midi_tracks.push(default_midi);
+
         let project_session = ProjectSession::new(project);
         let asset_manager = AssetManager::new(Some(active_sr));
         let midi_ports = MidiInputManager::enumerate_input_ports().unwrap_or_default();
         let midi_input_ring = Arc::new(MidiInputRing::new());
 
-        Self {
+        let mut app = Self {
             device_manager: mgr,
             output_devices,
             selected_device_name,
@@ -429,10 +437,10 @@ impl EsperiaApp {
             _midi_connection: None,
             midi_input_ring,
             midi_recorder: MidiRecorder::new(),
-            show_piano_roll: false,
+            show_piano_roll: true,
             piano_roll_height: 320.0,
-            active_midi_track_id: None,
-            active_midi_clip_id: None,
+            active_midi_track_id: Some(default_tid),
+            active_midi_clip_id: Some(default_cid),
             piano_roll_state: piano_roll::PianoRollState::default(),
             timeline_zoom: DEFAULT_ZOOM,
             selected_clip: None,
@@ -442,7 +450,9 @@ impl EsperiaApp {
             loop_enabled: false,
             loop_start_frame: 0,
             loop_end_frame: (active_sr as u64) * 4,
-        }
+        };
+        app.rebuild_midi_schedule();
+        app
     }
 
     // ── Device switching ──────────────────────────────────────────────────────
@@ -1166,22 +1176,13 @@ impl eframe::App for EsperiaApp {
         });
 
         // ── Status bar ────────────────────────────────────────────────────────
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Status:");
-                ui.monospace(&self.status_message);
-                ui.separator();
-                let ph = self.engine_handle.playhead_frame();
-                let ph_secs = ph as f64 / self.active_sample_rate.max(1) as f64;
-                ui.label(format!(
-                    "Position: {:.3} s  |  {:02}:{:02}.{:03}",
-                    ph_secs,
-                    ph_secs as u64 / 60,
-                    ph_secs as u64 % 60,
-                    ((ph_secs * 1000.0) as u64 % 1000)
-                ));
+        egui::Panel::bottom("status_bar")
+            .exact_size(22.0)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.weak(&self.status_message);
+                });
             });
-        });
 
         // ── Transport bar ─────────────────────────────────────────────────────
         egui::Panel::top("transport").show(ui, |ui| {
@@ -2112,7 +2113,21 @@ impl EsperiaApp {
             let rect = response.rect;
             let lane_x_start = rect.left() + TRACK_HEADER_WIDTH;
 
-            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(28));
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 32));
+            // Track-header column background
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    rect.min,
+                    egui::pos2(lane_x_start, rect.bottom()),
+                ),
+                0.0,
+                egui::Color32::from_rgb(44, 44, 46),
+            );
+            painter.vline(
+                lane_x_start,
+                rect.top()..=rect.bottom(),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 24, 26)),
+            );
 
             // ── Time ruler (Bars & Beats synced with LCD & Piano Roll) ──────
             let ruler_rect =
@@ -2139,6 +2154,11 @@ impl EsperiaApp {
                 let mf = tempo_map.tick_to_sample(tick_cursor, sr_u32);
                 let x = lane_x_start + mf as f32 * self.timeline_zoom;
                 if bar_num.saturating_sub(1).is_multiple_of(bar_step) {
+                    painter.vline(
+                        x,
+                        (rect.top() + RULER_HEIGHT)..=rect.bottom(),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 44, 48)),
+                    );
                     painter.line_segment(
                         [
                             egui::pos2(x, rect.top() + RULER_HEIGHT - 10.0),
