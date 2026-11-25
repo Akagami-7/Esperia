@@ -11,6 +11,8 @@
 //! Neither `audio-engine` nor `audio-io` depends on each other — this crate
 //! wires them together as the top-level coordinator.
 
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod piano_roll;
 mod volume_glider;
 
@@ -114,6 +116,9 @@ impl ThumbnailCache {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct EsperiaApp {
+    #[cfg(target_os = "macos")]
+    native_menu: Option<macos_menu::NativeMenu>,
+
     // ── Audio subsystem ──────────────────────────────────────────────────
     device_manager: Option<AudioDeviceManager>,
     output_devices: Vec<AudioDeviceInfo>,
@@ -399,7 +404,18 @@ impl EsperiaApp {
         let midi_ports = MidiInputManager::enumerate_input_ports().unwrap_or_default();
         let midi_input_ring = Arc::new(MidiInputRing::new());
 
+        #[cfg(target_os = "macos")]
+        let native_menu = match macos_menu::NativeMenu::install() {
+            Ok(menu) => Some(menu),
+            Err(error) => {
+                tracing::error!(%error, "failed to install macOS menu bar");
+                None
+            }
+        };
+
         let mut app = Self {
+            #[cfg(target_os = "macos")]
+            native_menu,
             device_manager: mgr,
             output_devices,
             selected_device_name,
@@ -1107,6 +1123,55 @@ impl eframe::App for EsperiaApp {
         self.poll_pending_imports();
         self.poll_midi_input();
 
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.native_menu {
+            let actions: Vec<_> = menu.poll_actions().collect();
+            for action in actions {
+                match action {
+                    macos_menu::Action::ImportAudio => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Audio", &["wav", "wave"])
+                            .pick_file()
+                        {
+                            self.import_audio_file(path, None);
+                        }
+                    }
+                    macos_menu::Action::SaveProject => self.save_project_dialog(),
+                    macos_menu::Action::OpenProject => self.load_project_dialog(),
+                    macos_menu::Action::Quit => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    macos_menu::Action::Undo => {
+                        if self.project_session.can_undo() {
+                            let _ = self.project_session.undo();
+                            self.rebuild_schedule();
+                        }
+                    }
+                    macos_menu::Action::Redo => {
+                        if self.project_session.can_redo() {
+                            let _ = self.project_session.redo();
+                            self.rebuild_schedule();
+                        }
+                    }
+                    macos_menu::Action::AddTrack => {
+                        let idx = self.project_session.project().tracks.len() + 1;
+                        let _ = self.project_session.execute(ProjectCommand::AddTrack {
+                            name: format!("Track {idx}"),
+                        });
+                    }
+                    macos_menu::Action::ToggleDevicePanel => {
+                        self.show_device_panel = !self.show_device_panel;
+                    }
+                    macos_menu::Action::ToggleMixer => {
+                        self.show_mixer_panel = !self.show_mixer_panel;
+                    }
+                    macos_menu::Action::TogglePianoRoll => {
+                        self.show_piano_roll = !self.show_piano_roll;
+                    }
+                }
+            }
+        }
+
         if let Some(err) = self.stream_errors.take() {
             self.stream_active.store(false, Ordering::Release);
             self.status_message = format!("CPAL output error: {err}");
@@ -1117,6 +1182,7 @@ impl eframe::App for EsperiaApp {
         }
 
         // ── Menu bar ─────────────────────────────────────────────────────────
+        #[cfg(not(target_os = "macos"))]
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
