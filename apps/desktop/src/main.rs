@@ -15,6 +15,7 @@ use eframe::egui;
 use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, MonitorRing, ScheduledClip};
 use esperia_audio_io::{AudioDeviceInfo, AudioDeviceManager, StreamErrorChannel, cpal};
 use esperia_media::{AssetManager, DecodedAudio, LoadStatus};
+use esperia_mixer::{BusConfig, ChannelConfig, MixerGraph, MixerMeters, RouteTarget};
 use esperia_project_model::{
     audio_source::SourceId,
     clip::ClipId,
@@ -133,6 +134,10 @@ struct EsperiaApp {
     thumbnail_cache: ThumbnailCache,
     pending_imports: Vec<PendingImport>,
     next_temp_source_seq: u64,
+
+    // ── Mixer ─────────────────────────────────────────────────────────────
+    mixer_meters: Option<MixerMeters>,
+    show_mixer_panel: bool,
 
     // ── UI state ─────────────────────────────────────────────────────────
     frequency: f32,
@@ -385,6 +390,8 @@ impl EsperiaApp {
             amplitude: 0.1,
             status_message: status,
             show_device_panel: false,
+            mixer_meters: None,
+            show_mixer_panel: false,
             timeline_zoom: DEFAULT_ZOOM,
             selected_clip: None,
             drag_state: None,
@@ -629,6 +636,7 @@ impl EsperiaApp {
 
                 clips.push(ScheduledClip {
                     clip_id: clip.id.0,
+                    track_id: track.id.0,
                     timeline_start_frame: clip.timeline_start_frame,
                     source_offset_frame: clip.source_offset_frame,
                     duration_frames,
@@ -641,6 +649,55 @@ impl EsperiaApp {
 
         let schedule = Arc::new(ClipSchedule { clips });
         self.engine_handle.set_clip_schedule(schedule);
+    }
+
+    // ── Mixer graph rebuild ────────────────────────────────────────────────────
+
+    /// Build a fresh `MixerGraph` from current project tracks and push it to
+    /// the audio thread lock-free.  Called after every track/project change.
+    fn rebuild_mixer(&mut self) {
+        let project = self.project_session.project();
+        let any_solo = project.tracks.iter().any(|t| t.soloed);
+
+        let channel_cfgs: Vec<ChannelConfig> = project
+            .tracks
+            .iter()
+            .map(|t| {
+                let audible = if any_solo {
+                    t.soloed && !t.muted
+                } else {
+                    !t.muted
+                };
+                ChannelConfig {
+                    id: t.id.0,
+                    name: t.name.clone(),
+                    gain_db: t.gain_db,
+                    pan: 0.0, // Track pan not yet in project model; default centre
+                    muted: !audible,
+                    soloed: t.soloed,
+                    output: RouteTarget::Master,
+                    sends: vec![],
+                }
+            })
+            .collect();
+
+        // Buffer size hint from current stream; fall back to 1024 frames
+        let buf_frames = self.buffer_frames_hint.load(Ordering::Relaxed).max(64) as usize;
+        // Allocate with 4× headroom so the preallocated buffer covers large
+        // device buffer sizes without real-time reallocation.
+        let max_frames = buf_frames * 4;
+
+        let buses: Vec<BusConfig> = vec![];
+
+        match MixerGraph::new(&channel_cfgs, &buses, 0.0, max_frames) {
+            Ok(graph) => {
+                let meters = self.engine_handle.set_mixer_graph(graph);
+                self.mixer_meters = Some(meters);
+            }
+            Err(e) => {
+                tracing::warn!("rebuild_mixer: MixerGraph::new failed: {e:?}");
+            }
+        }
     }
 
     // ── Import audio ──────────────────────────────────────────────────────────
@@ -921,6 +978,10 @@ impl eframe::App for EsperiaApp {
                         self.show_device_panel = !self.show_device_panel;
                         ui.close();
                     }
+                    if ui.button("🎚 Toggle Mixer").clicked() {
+                        self.show_mixer_panel = !self.show_mixer_panel;
+                        ui.close();
+                    }
                 });
             });
         });
@@ -954,6 +1015,15 @@ impl eframe::App for EsperiaApp {
                 .min_size(250.0)
                 .show(ui, |ui| {
                     self.draw_device_panel(ui);
+                });
+        }
+
+        // ── Mixer panel (collapsible bottom strip) ────────────────────────────
+        if self.show_mixer_panel {
+            egui::Panel::bottom("mixer_panel")
+                .min_size(160.0)
+                .show(ui, |ui| {
+                    self.draw_mixer_panel(ui);
                 });
         }
 
@@ -1107,6 +1177,247 @@ impl EsperiaApp {
             if ui.button("💾 Save").clicked() {
                 self.save_project_dialog();
             }
+
+            ui.separator();
+
+            let mix_btn_text = if self.show_mixer_panel {
+                "🎚 Mixer ON"
+            } else {
+                "🎚 Mixer"
+            };
+            if ui
+                .add(
+                    egui::Button::new(mix_btn_text).fill(if self.show_mixer_panel {
+                        egui::Color32::from_rgb(55, 130, 190)
+                    } else {
+                        egui::Color32::from_gray(65)
+                    }),
+                )
+                .clicked()
+            {
+                self.show_mixer_panel = !self.show_mixer_panel;
+                if self.show_mixer_panel {
+                    self.rebuild_mixer();
+                }
+            }
+        });
+    }
+
+    // ── Mixer panel ───────────────────────────────────────────────────────────
+
+    /// Bottom mixer strip: one channel strip per track + master.
+    fn draw_mixer_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Mixer");
+        ui.add_space(4.0);
+        ui.separator();
+
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Collect track info we need (name, id, gain_db, muted, soloed)
+                let tracks: Vec<(u64, String, f32, bool, bool)> = self
+                    .project_session
+                    .project()
+                    .tracks
+                    .iter()
+                    .map(|t| (t.id.0, t.name.clone(), t.gain_db, t.muted, t.soloed))
+                    .collect();
+
+                let any_solo = tracks.iter().any(|(_, _, _, _, s)| *s);
+
+                for (tid, name, gain_db, muted, soloed) in &tracks {
+                    // Read live meter for this channel (lock-free)
+                    let reading = self
+                        .mixer_meters
+                        .as_ref()
+                        .and_then(|m| m.channels.get(tid))
+                        .map(|a| a.read());
+
+                    let peak = reading
+                        .as_ref()
+                        .map(|r| r.peak_left.max(r.peak_right))
+                        .unwrap_or(0.0);
+                    let rms = reading
+                        .as_ref()
+                        .map(|r| r.rms_left.max(r.rms_right))
+                        .unwrap_or(0.0);
+                    let clipped = reading.as_ref().map(|r| r.clipped).unwrap_or(false);
+
+                    ui.group(|ui| {
+                        ui.set_min_width(72.0);
+                        ui.vertical(|ui| {
+                            // Track name
+                            ui.label(egui::RichText::new(name.as_str()).small());
+
+                            // Peak / RMS meter bar (vertical, 80 px tall)
+                            let (rect, _resp) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 80.0), egui::Sense::hover());
+                            let painter = ui.painter();
+                            // Background
+                            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+                            // RMS bar (green/yellow/red)
+                            let rms_h = rms.min(1.0) * rect.height();
+                            let rms_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), rect.bottom() - rms_h),
+                                egui::vec2(rect.width(), rms_h),
+                            );
+                            let rms_color = if rms > 0.9 {
+                                egui::Color32::RED
+                            } else if rms > 0.7 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgb(80, 200, 100)
+                            };
+                            painter.rect_filled(rms_rect, 0.0, rms_color);
+                            // Peak tick
+                            if peak > 0.01 {
+                                let pk_y = rect.bottom() - (peak.min(1.0) * rect.height());
+                                painter.hline(
+                                    rect.left()..=rect.right(),
+                                    pk_y,
+                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                );
+                            }
+                            // Clip indicator (red bar at top)
+                            if clipped {
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(rect.width(), 6.0),
+                                    ),
+                                    0.0,
+                                    egui::Color32::RED,
+                                );
+                            }
+
+                            // Gain (dB) drag
+                            let mut g = *gain_db;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut g)
+                                        .speed(0.5)
+                                        .range(-60.0..=12.0)
+                                        .suffix(" dB"),
+                                )
+                                .changed()
+                            {
+                                let _ =
+                                    self.project_session
+                                        .execute(ProjectCommand::ChangeTrackGain {
+                                            track_id: esperia_project_model::track::TrackId(*tid),
+                                            gain_db: g,
+                                        });
+                                self.rebuild_schedule();
+                                self.rebuild_mixer();
+                            }
+
+                            // Mute / Solo buttons
+                            ui.horizontal(|ui| {
+                                let mute_col = if *muted {
+                                    egui::Color32::from_rgb(200, 150, 30)
+                                } else {
+                                    egui::Color32::from_gray(60)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new("M")
+                                            .fill(mute_col)
+                                            .min_size(egui::vec2(20.0, 18.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    let _ = self.project_session.execute(
+                                        ProjectCommand::SetTrackMute {
+                                            track_id: esperia_project_model::track::TrackId(*tid),
+                                            muted: !muted,
+                                        },
+                                    );
+                                    self.rebuild_schedule();
+                                    self.rebuild_mixer();
+                                }
+                                let solo_col = if *soloed {
+                                    egui::Color32::from_rgb(220, 200, 30)
+                                } else {
+                                    egui::Color32::from_gray(60)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new("S")
+                                            .fill(solo_col)
+                                            .min_size(egui::vec2(20.0, 18.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    let _ = self.project_session.execute(
+                                        ProjectCommand::SetTrackSolo {
+                                            track_id: esperia_project_model::track::TrackId(*tid),
+                                            soloed: !soloed,
+                                        },
+                                    );
+                                    self.rebuild_schedule();
+                                    self.rebuild_mixer();
+                                }
+                            });
+
+                            // Audibility dot
+                            let audible = if any_solo { *soloed && !muted } else { !muted };
+                            let dot_color = if audible {
+                                egui::Color32::from_rgb(80, 200, 100)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            };
+                            ui.colored_label(dot_color, "●");
+                        });
+                    });
+                }
+
+                // ── Master channel strip ──────────────────────────────────
+                ui.separator();
+                ui.group(|ui| {
+                    ui.set_min_width(80.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Master").strong().small());
+
+                        let m_reading = self.mixer_meters.as_ref().map(|m| m.master.read());
+                        let m_peak = m_reading
+                            .as_ref()
+                            .map(|r| r.peak_left.max(r.peak_right))
+                            .unwrap_or(0.0);
+                        let m_rms = m_reading
+                            .as_ref()
+                            .map(|r| r.rms_left.max(r.rms_right))
+                            .unwrap_or(0.0);
+
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(20.0, 80.0), egui::Sense::hover());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+                        let rms_h = m_rms.min(1.0) * rect.height();
+                        let rms_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.left(), rect.bottom() - rms_h),
+                            egui::vec2(rect.width(), rms_h),
+                        );
+                        let rms_color = if m_rms > 0.9 {
+                            egui::Color32::RED
+                        } else if m_rms > 0.7 {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::from_rgb(80, 200, 100)
+                        };
+                        painter.rect_filled(rms_rect, 0.0, rms_color);
+                        if m_peak > 0.01 {
+                            let pk_y = rect.bottom() - (m_peak.min(1.0) * rect.height());
+                            painter.hline(
+                                rect.left()..=rect.right(),
+                                pk_y,
+                                egui::Stroke::new(1.5, egui::Color32::WHITE),
+                            );
+                        }
+
+                        ui.label(format!("pk {m_peak:.2}"));
+                        ui.label(format!("rms {m_rms:.2}"));
+                    });
+                });
+            });
         });
     }
 

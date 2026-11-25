@@ -53,6 +53,7 @@ fn multitrack_simultaneous_clips_decoded_and_mixed() {
         clips: vec![
             ScheduledClip {
                 clip_id: 1,
+                track_id: 1,
                 timeline_start_frame: 0,
                 source_offset_frame: 0,
                 duration_frames: dec_a.duration_frames,
@@ -62,6 +63,7 @@ fn multitrack_simultaneous_clips_decoded_and_mixed() {
             },
             ScheduledClip {
                 clip_id: 2,
+                track_id: 2,
                 timeline_start_frame: 0,
                 source_offset_frame: 0,
                 duration_frames: dec_b.duration_frames,
@@ -108,6 +110,7 @@ fn different_sample_rates_resampled_and_played_across_buffer_sizes() {
         let schedule = Arc::new(ClipSchedule {
             clips: vec![ScheduledClip {
                 clip_id: 1,
+                track_id: 1,
                 timeline_start_frame: 0,
                 source_offset_frame: 0,
                 duration_frames: decoded.duration_frames,
@@ -139,6 +142,7 @@ fn rapid_seek_play_pause_stop_and_loop_stability() {
     let schedule = Arc::new(ClipSchedule {
         clips: vec![ScheduledClip {
             clip_id: 10,
+            track_id: 1,
             timeline_start_frame: 0,
             source_offset_frame: 0,
             duration_frames: 48_000,

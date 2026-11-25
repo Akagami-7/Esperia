@@ -1151,6 +1151,9 @@ checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 [[package]]
 name = "esperia-audio-engine"
 version = "0.1.0"
+dependencies = [
+ "esperia-mixer",
+]
 
 [[package]]
 name = "esperia-audio-io"
@@ -1167,6 +1170,7 @@ dependencies = [
  "esperia-audio-engine",
  "esperia-audio-io",
  "esperia-media",
+ "esperia-mixer",
  "esperia-project-model",
  "esperia-recording",
  "rfd",
@@ -1185,6 +1189,10 @@ dependencies = [
  "symphonia",
  "tempfile",
 ]
+
+[[package]]
+name = "esperia-mixer"
+version = "0.1.0"
 
 [[package]]
 name = "esperia-project-model"
