@@ -11,10 +11,16 @@
 //! Neither `audio-engine` nor `audio-io` depends on each other — this crate
 //! wires them together as the top-level coordinator.
 
+mod piano_roll;
+
 use eframe::egui;
 use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, MonitorRing, ScheduledClip};
 use esperia_audio_io::{AudioDeviceInfo, AudioDeviceManager, StreamErrorChannel, cpal};
 use esperia_media::{AssetManager, DecodedAudio, LoadStatus};
+use esperia_midi::{
+    InstrumentKind, MidiClip, MidiInputConnection, MidiInputManager, MidiInputRing, MidiMessage,
+    MidiPortInfo, MidiRecorder, MidiSchedule, MidiTrack, PPQN,
+};
 use esperia_mixer::{BusConfig, ChannelConfig, MixerGraph, MixerMeters, RouteTarget};
 use esperia_project_model::{
     audio_source::SourceId,
@@ -138,6 +144,17 @@ struct EsperiaApp {
     // ── Mixer ─────────────────────────────────────────────────────────────
     mixer_meters: Option<MixerMeters>,
     show_mixer_panel: bool,
+
+    // ── MIDI & Piano Roll ────────────────────────────────────────────────
+    midi_ports: Vec<MidiPortInfo>,
+    selected_midi_port: Option<usize>,
+    _midi_connection: Option<MidiInputConnection>,
+    midi_input_ring: Arc<MidiInputRing>,
+    midi_recorder: MidiRecorder,
+    show_piano_roll: bool,
+    active_midi_track_id: Option<u64>,
+    active_midi_clip_id: Option<u64>,
+    piano_roll_state: piano_roll::PianoRollState,
 
     // ── UI state ─────────────────────────────────────────────────────────
     frequency: f32,
@@ -355,6 +372,8 @@ impl EsperiaApp {
             .expect("default project parameters are valid");
         let project_session = ProjectSession::new(project);
         let asset_manager = AssetManager::new(Some(active_sr));
+        let midi_ports = MidiInputManager::enumerate_input_ports().unwrap_or_default();
+        let midi_input_ring = Arc::new(MidiInputRing::new());
 
         Self {
             device_manager: mgr,
@@ -392,6 +411,15 @@ impl EsperiaApp {
             show_device_panel: false,
             mixer_meters: None,
             show_mixer_panel: false,
+            midi_ports,
+            selected_midi_port: None,
+            _midi_connection: None,
+            midi_input_ring,
+            midi_recorder: MidiRecorder::new(),
+            show_piano_roll: false,
+            active_midi_track_id: None,
+            active_midi_clip_id: None,
+            piano_roll_state: piano_roll::PianoRollState::default(),
             timeline_zoom: DEFAULT_ZOOM,
             selected_clip: None,
             drag_state: None,
@@ -700,6 +728,120 @@ impl EsperiaApp {
         }
     }
 
+    // ── MIDI scheduling, input & recording ────────────────────────────────────
+
+    fn rebuild_midi_schedule(&mut self) {
+        let project = self.project_session.project();
+        let sched = MidiSchedule::from_tracks(
+            &project.midi_tracks,
+            &project.tempo_map,
+            self.active_sample_rate,
+        );
+        self.engine_handle.set_midi_schedule(Arc::new(sched));
+    }
+
+    fn connect_midi_port(&mut self, port_index: usize) {
+        match MidiInputManager::open_input_port(port_index, Arc::clone(&self.midi_input_ring)) {
+            Ok(conn) => {
+                self._midi_connection = Some(conn);
+                self.selected_midi_port = Some(port_index);
+                let name = self
+                    .midi_ports
+                    .get(port_index)
+                    .map_or("MIDI Port", |p| p.name.as_str());
+                self.status_message = format!("MIDI connected: {name}");
+            }
+            Err(e) => {
+                self.status_message = format!("MIDI connect failed: {e}");
+            }
+        }
+    }
+
+    fn poll_midi_input(&mut self) {
+        let playhead = self.engine_handle.playhead_frame();
+        let tempo_map = self.project_session.project().tempo_map.clone();
+        while let Some(ev) = self.midi_input_ring.pop() {
+            self.engine_handle.send_live_midi(ev.message);
+            if self.midi_recorder.is_recording() {
+                self.midi_recorder.record_message(
+                    ev.message,
+                    playhead,
+                    &tempo_map,
+                    self.active_sample_rate,
+                );
+            }
+        }
+    }
+
+    fn add_midi_track(&mut self) {
+        let proj = self.project_session.project_mut();
+        let tid = proj.allocate_id();
+        let cid = proj.allocate_id();
+        let idx = proj.midi_tracks.len() + 1;
+        let mut track = MidiTrack::new(tid, format!("MIDI {idx}"));
+        track
+            .clips
+            .push(MidiClip::new(cid, format!("Pattern {idx}"), 0, PPQN * 4));
+        proj.midi_tracks.push(track);
+
+        self.active_midi_track_id = Some(tid);
+        self.active_midi_clip_id = Some(cid);
+        self.show_piano_roll = true;
+        self.rebuild_midi_schedule();
+        self.status_message = format!("Added MIDI {idx}");
+    }
+
+    fn toggle_midi_recording(&mut self) {
+        if self.midi_recorder.is_recording() {
+            let stop_frame = self.engine_handle.playhead_frame();
+            let tempo_map = self.project_session.project().tempo_map.clone();
+            self.engine_handle.pause();
+            if let Some((tid, clip)) =
+                self.midi_recorder
+                    .stop_recording(stop_frame, &tempo_map, self.active_sample_rate)
+            {
+                let cid = clip.id;
+                let note_count = clip.notes.len();
+                let proj = self.project_session.project_mut();
+                if let Some(track) = proj.midi_tracks.iter_mut().find(|t| t.id == tid) {
+                    track.clips.push(clip);
+                }
+                self.active_midi_track_id = Some(tid);
+                self.active_midi_clip_id = Some(cid);
+                self.show_piano_roll = true;
+                self.rebuild_midi_schedule();
+                self.status_message = format!("MIDI recorded ({note_count} notes)");
+            }
+            return;
+        }
+
+        if self.active_midi_track_id.is_none()
+            && self.project_session.project().midi_tracks.is_empty()
+        {
+            self.add_midi_track();
+        }
+        let target_tid = self.active_midi_track_id.or_else(|| {
+            self.project_session
+                .project()
+                .midi_tracks
+                .first()
+                .map(|t| t.id)
+        });
+
+        if let Some(tid) = target_tid {
+            self.midi_recorder.arm_track(Some(tid));
+            let start_frame = self.engine_handle.playhead_frame();
+            let tempo_map = self.project_session.project().tempo_map.clone();
+            if self
+                .midi_recorder
+                .start_recording(start_frame, &tempo_map, self.active_sample_rate)
+            {
+                self.engine_handle.play();
+                self.status_message = "MIDI Recording…".into();
+            }
+        }
+    }
+
     // ── Import audio ──────────────────────────────────────────────────────────
 
     fn import_audio_file(&mut self, path: PathBuf, target_track_id: Option<TrackId>) {
@@ -911,6 +1053,7 @@ impl eframe::App for EsperiaApp {
         ctx.request_repaint();
 
         self.poll_pending_imports();
+        self.poll_midi_input();
 
         if let Some(err) = self.stream_errors.take() {
             self.stream_active.store(false, Ordering::Release);
@@ -982,6 +1125,10 @@ impl eframe::App for EsperiaApp {
                         self.show_mixer_panel = !self.show_mixer_panel;
                         ui.close();
                     }
+                    if ui.button("🎹 Toggle Piano Roll").clicked() {
+                        self.show_piano_roll = !self.show_piano_roll;
+                        ui.close();
+                    }
                 });
             });
         });
@@ -1024,6 +1171,15 @@ impl eframe::App for EsperiaApp {
                 .min_size(160.0)
                 .show(ui, |ui| {
                     self.draw_mixer_panel(ui);
+                });
+        }
+
+        // ── Piano Roll panel (collapsible bottom editor) ──────────────────────
+        if self.show_piano_roll {
+            egui::Panel::bottom("piano_roll_panel")
+                .min_size(260.0)
+                .show(ui, |ui| {
+                    self.draw_piano_roll_panel(ui);
                 });
         }
 
@@ -1174,6 +1330,39 @@ impl EsperiaApp {
                 });
             }
 
+            if ui.button("🎹 +MIDI").clicked() {
+                self.add_midi_track();
+            }
+
+            let midi_rec = self.midi_recorder.is_recording();
+            let midi_rec_btn = egui::Button::new(if midi_rec {
+                "⏹ Stop MIDI"
+            } else {
+                "⏺ Rec MIDI"
+            })
+            .fill(if midi_rec {
+                egui::Color32::from_rgb(200, 60, 40)
+            } else {
+                egui::Color32::from_gray(65)
+            });
+            if ui.add(midi_rec_btn).clicked() {
+                self.toggle_midi_recording();
+            }
+
+            let pr_btn = egui::Button::new(if self.show_piano_roll {
+                "🎹 Piano Roll ON"
+            } else {
+                "🎹 Piano Roll"
+            })
+            .fill(if self.show_piano_roll {
+                egui::Color32::from_rgb(55, 130, 190)
+            } else {
+                egui::Color32::from_gray(65)
+            });
+            if ui.add(pr_btn).clicked() {
+                self.show_piano_roll = !self.show_piano_roll;
+            }
+
             if ui.button("💾 Save").clicked() {
                 self.save_project_dialog();
             }
@@ -1201,6 +1390,121 @@ impl EsperiaApp {
                 }
             }
         });
+    }
+
+    fn draw_piano_roll_panel(&mut self, ui: &mut egui::Ui) {
+        if self.project_session.project().midi_tracks.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("No MIDI tracks yet.");
+                if ui.button("🎹 Create MIDI Track").clicked() {
+                    self.add_midi_track();
+                }
+            });
+            return;
+        }
+
+        // Track / clip / instrument selector bar
+        let track_options: Vec<(u64, String, InstrumentKind)> = self
+            .project_session
+            .project()
+            .midi_tracks
+            .iter()
+            .map(|t| (t.id, t.name.clone(), t.instrument))
+            .collect();
+
+        if self.active_midi_track_id.is_none() {
+            self.active_midi_track_id = track_options.first().map(|(id, _, _)| *id);
+        }
+
+        let mut schedule_dirty = false;
+        ui.horizontal(|ui| {
+            let active_tid = self.active_midi_track_id.unwrap_or(0);
+            let active_name = track_options
+                .iter()
+                .find(|(id, _, _)| *id == active_tid)
+                .map_or("Select Track", |(_, n, _)| n.as_str());
+            egui::ComboBox::from_id_salt("pr_track_sel")
+                .selected_text(active_name)
+                .show_ui(ui, |ui| {
+                    for (id, name, _) in &track_options {
+                        if ui.selectable_label(*id == active_tid, name).clicked() {
+                            self.active_midi_track_id = Some(*id);
+                            self.active_midi_clip_id = self
+                                .project_session
+                                .project()
+                                .midi_tracks
+                                .iter()
+                                .find(|t| t.id == *id)
+                                .and_then(|t| t.clips.first().map(|c| c.id));
+                        }
+                    }
+                });
+
+            // Instrument preset selector for the active MIDI track
+            if let Some((_, _, current_inst)) =
+                track_options.iter().find(|(id, _, _)| *id == active_tid)
+            {
+                let mut selected_inst = *current_inst;
+                egui::ComboBox::from_id_salt("pr_inst_sel")
+                    .selected_text(selected_inst.display_name())
+                    .show_ui(ui, |ui| {
+                        for inst in InstrumentKind::ALL {
+                            if ui
+                                .selectable_value(&mut selected_inst, inst, inst.display_name())
+                                .changed()
+                            {
+                                let proj = self.project_session.project_mut();
+                                if let Some(track) =
+                                    proj.midi_tracks.iter_mut().find(|t| t.id == active_tid)
+                                {
+                                    track.instrument = selected_inst;
+                                    track.program = match selected_inst {
+                                        InstrumentKind::ElectricPiano => 0,
+                                        InstrumentKind::SineSynth => 1,
+                                        InstrumentKind::TriangleSynth => 2,
+                                        InstrumentKind::SawSynth => 3,
+                                    };
+                                    self.engine_handle
+                                        .send_live_midi(MidiMessage::ProgramChange {
+                                            channel: track.channel,
+                                            program: track.program,
+                                        });
+                                    schedule_dirty = true;
+                                }
+                            }
+                        }
+                    });
+            }
+        });
+
+        let active_tid = self.active_midi_track_id.unwrap_or(0);
+        if self.active_midi_clip_id.is_none() {
+            self.active_midi_clip_id = self
+                .project_session
+                .project()
+                .midi_tracks
+                .iter()
+                .find(|t| t.id == active_tid)
+                .and_then(|t| t.clips.first().map(|c| c.id));
+        }
+
+        if let Some(active_cid) = self.active_midi_clip_id {
+            let engine_handle = self.engine_handle.clone();
+            let pr_state = &mut self.piano_roll_state;
+            let proj = self.project_session.project_mut();
+            if let Some(track) = proj.midi_tracks.iter_mut().find(|t| t.id == active_tid) {
+                let ch = track.channel;
+                if let Some(clip) = track.find_clip_mut(active_cid)
+                    && pr_state.draw(ui, clip, ch, &engine_handle)
+                {
+                    schedule_dirty = true;
+                }
+            }
+        }
+
+        if schedule_dirty {
+            self.rebuild_midi_schedule();
+        }
     }
 
     // ── Mixer panel ───────────────────────────────────────────────────────────
@@ -1532,6 +1836,34 @@ impl EsperiaApp {
         ));
         if !self.recorder.takes().is_empty() {
             ui.label(format!("Recorded takes: {}", self.recorder.takes().len()));
+        }
+
+        ui.separator();
+        ui.heading("MIDI Input");
+        ui.add_space(4.0);
+
+        let selected_midi_label = self
+            .selected_midi_port
+            .and_then(|idx| self.midi_ports.get(idx))
+            .map_or("None".to_string(), |p| p.name.clone());
+        let mut connect_idx: Option<usize> = None;
+        egui::ComboBox::from_label("MIDI Keyboard")
+            .selected_text(&selected_midi_label)
+            .show_ui(ui, |ui| {
+                for port in &self.midi_ports {
+                    if ui
+                        .selectable_label(self.selected_midi_port == Some(port.index), &port.name)
+                        .clicked()
+                    {
+                        connect_idx = Some(port.index);
+                    }
+                }
+            });
+        if ui.button("Refresh MIDI Ports").clicked() {
+            self.midi_ports = MidiInputManager::enumerate_input_ports().unwrap_or_default();
+        }
+        if let Some(idx) = connect_idx {
+            self.connect_midi_port(idx);
         }
 
         ui.separator();

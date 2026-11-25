@@ -258,6 +258,8 @@ fn parse_and_migrate(raw_json: &str) -> Result<(Project, Option<u32>), ProjectEr
                 timeline,
                 sources: Vec::new(),
                 tracks: v1.tracks,
+                midi_tracks: Vec::new(),
+                tempo_map: esperia_midi::TempoMap::constant(v1.tempo_bpm),
                 next_id: v1.next_id.max(1),
             };
             Ok((project, Some(1)))

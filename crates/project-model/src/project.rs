@@ -28,6 +28,10 @@ pub struct Project {
     pub timeline: Timeline,
     pub sources: Vec<AudioSource>,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub midi_tracks: Vec<esperia_midi::MidiTrack>,
+    #[serde(default)]
+    pub tempo_map: esperia_midi::TempoMap,
     /// Monotonic ID counter persisted with the project so IDs never collide across reloads.
     pub next_id: u64,
 }
@@ -56,6 +60,8 @@ impl Project {
             timeline,
             sources: Vec::new(),
             tracks: Vec::new(),
+            midi_tracks: Vec::new(),
+            tempo_map: esperia_midi::TempoMap::constant(tempo_bpm),
             next_id: 1,
         })
     }

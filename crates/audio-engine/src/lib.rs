@@ -14,6 +14,9 @@
 //! * `ScheduledClip` holds an `Arc<DecodedSamples>` (a type-alias for
 //!   `Arc<Vec<f32>>`) so the callback can read decoded audio without allocation.
 
+pub mod synth;
+
+use esperia_midi::{ActiveNoteTracker, InstrumentKind, MidiInputRing, MidiMessage, MidiSchedule};
 use esperia_mixer::{MixerGraph, MixerMeters};
 use std::cell::UnsafeCell;
 use std::f32::consts::TAU;
@@ -21,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
+use synth::PolySynth;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DecodedSamples — shared audio data
@@ -494,12 +498,16 @@ pub struct EngineHandle {
     pub telemetry: Arc<EngineTelemetry>,
     /// Lock-free pointer to the current `ClipSchedule`.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Lock-free pointer to the current `MidiSchedule`.
+    midi_schedule_ptr: Arc<AtomicPtr<MidiSchedule>>,
     /// Lock-free pointer for pushing a newly-built `MixerGraph` to the audio thread.
     pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Lock-free pointer for returning a retired `MixerGraph` to the UI thread for drop.
     retired_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Lock-free ring for live input monitoring (written by input callback).
     monitor_ring: Arc<MonitorRing>,
+    /// Lock-free ring for live MIDI keyboard / Piano Roll preview input.
+    live_midi_ring: Arc<MidiInputRing>,
 }
 
 impl EngineHandle {
@@ -553,6 +561,26 @@ impl EngineHandle {
 
     pub fn monitor_ring(&self) -> Arc<MonitorRing> {
         Arc::clone(&self.monitor_ring)
+    }
+
+    pub fn live_midi_ring(&self) -> Arc<MidiInputRing> {
+        Arc::clone(&self.live_midi_ring)
+    }
+
+    /// Push a live MIDI message (e.g. from a MIDI keyboard or Piano Roll preview)
+    /// into the audio engine without blocking.
+    pub fn send_live_midi(&self, msg: MidiMessage) {
+        let _ = self.live_midi_ring.push(msg);
+    }
+
+    /// Replace the MIDI schedule lock-free.
+    pub fn set_midi_schedule(&self, schedule: Arc<MidiSchedule>) {
+        let new_raw = Arc::into_raw(schedule) as *mut MidiSchedule;
+        let old_raw = self.midi_schedule_ptr.swap(new_raw, Ordering::AcqRel);
+        if !old_raw.is_null() {
+            // SAFETY: we own the raw pointer because we stored it here originally.
+            let _ = unsafe { Arc::from_raw(old_raw as *const MidiSchedule) };
+        }
     }
 
     pub fn set_frequency(&self, hz: f32) {
@@ -630,6 +658,14 @@ impl Drop for EngineHandle {
                 let _ = unsafe { Arc::from_raw(raw as *const ClipSchedule) };
             }
         }
+        if Arc::strong_count(&self.midi_schedule_ptr) == 1 {
+            let raw = self
+                .midi_schedule_ptr
+                .swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !raw.is_null() {
+                let _ = unsafe { Arc::from_raw(raw as *const MidiSchedule) };
+            }
+        }
         if Arc::strong_count(&self.pending_mixer_ptr) == 1 {
             let raw = self
                 .pending_mixer_ptr
@@ -674,6 +710,8 @@ pub struct AudioEngine {
     input_monitoring_enabled: bool,
     /// Shared pointer to the current clip schedule.
     schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
+    /// Shared pointer to the current MIDI schedule.
+    midi_schedule_ptr: Arc<AtomicPtr<MidiSchedule>>,
     /// Active mixer routing graph (owned exclusively by audio thread).
     mixer: Option<MixerGraph>,
     pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
@@ -682,6 +720,14 @@ pub struct AudioEngine {
     monitor_ring: Arc<MonitorRing>,
     /// Preallocated scratch buffer for draining monitor samples.
     monitor_scratch: Vec<f32>,
+    /// Lock-free ring for live MIDI preview / keyboard input.
+    live_midi_ring: Arc<MidiInputRing>,
+    /// Built-in polyphonic synthesizer for MIDI playback & preview.
+    synth: PolySynth,
+    /// Zero-allocation tracker preventing stuck notes on stop/pause/seek/loop.
+    active_note_tracker: ActiveNoteTracker,
+    /// Preallocated stereo scratch buffer for MIDI synth rendering.
+    midi_scratch: Vec<f32>,
 }
 
 impl AudioEngine {
@@ -692,22 +738,27 @@ impl AudioEngine {
         let commands = Arc::new(CommandRing::<64>::new());
         let telemetry = Arc::new(EngineTelemetry::new());
         let schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let midi_schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let pending_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let retired_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let monitor_ring = Arc::new(MonitorRing::new(16_384));
+        let live_midi_ring = Arc::new(MidiInputRing::new());
 
         let handle = EngineHandle {
             commands: Arc::clone(&commands),
             telemetry: Arc::clone(&telemetry),
             schedule_ptr: Arc::clone(&schedule_ptr),
+            midi_schedule_ptr: Arc::clone(&midi_schedule_ptr),
             pending_mixer_ptr: Arc::clone(&pending_mixer_ptr),
             retired_mixer_ptr: Arc::clone(&retired_mixer_ptr),
             monitor_ring: Arc::clone(&monitor_ring),
+            live_midi_ring: Arc::clone(&live_midi_ring),
         };
 
         // Preallocate for the largest expected buffer (2048 frames × channels).
         let scratch = vec![0.0f32; 2048 * ch];
         let monitor_scratch = vec![0.0f32; 4096 * ch];
+        let midi_scratch = vec![0.0f32; 4096 * 2];
 
         let engine = Self {
             generator: SineGenerator::new(440.0, 0.1, sr, ch),
@@ -723,14 +774,27 @@ impl AudioEngine {
             loop_enabled: false,
             input_monitoring_enabled: false,
             schedule_ptr,
+            midi_schedule_ptr,
             mixer: None,
             pending_mixer_ptr,
             retired_mixer_ptr,
             monitor_ring,
             monitor_scratch,
+            live_midi_ring,
+            synth: PolySynth::new(0, InstrumentKind::ElectricPiano, sr),
+            active_note_tracker: ActiveNoteTracker::new(),
+            midi_scratch,
         };
 
         (engine, handle)
+    }
+
+    fn flush_midi_notes(&mut self) {
+        let synth = &mut self.synth;
+        self.active_note_tracker.flush_all_notes_off(|msg| {
+            synth.handle_message(msg);
+        });
+        synth.all_notes_off();
     }
 
     fn apply_reconfigure(&mut self, sample_rate: f32, channels: u16) {
@@ -739,6 +803,7 @@ impl AudioEngine {
         self.channels = ch;
         self.generator.set_sample_rate(self.sample_rate);
         self.generator.set_channels(ch);
+        self.synth.set_sample_rate(self.sample_rate);
     }
 
     /// **Audio callback entry point.**
@@ -772,6 +837,7 @@ impl AudioEngine {
                 EngineCommand::Stop => {
                     self.transport_state = transport::STOPPED;
                     self.generator.set_playing(false);
+                    self.flush_midi_notes();
                     self.playhead_frame = 0;
                     self.telemetry.is_playing.store(false, Ordering::Release);
                     self.telemetry
@@ -782,12 +848,14 @@ impl AudioEngine {
                 EngineCommand::Pause => {
                     self.transport_state = transport::PAUSED;
                     self.generator.set_playing(false);
+                    self.flush_midi_notes();
                     self.telemetry.is_playing.store(false, Ordering::Release);
                     self.telemetry
                         .transport_state
                         .store(transport::PAUSED, Ordering::Release);
                 }
                 EngineCommand::Seek { frame } => {
+                    self.flush_midi_notes();
                     self.playhead_frame = frame;
                     self.telemetry
                         .playhead_frame
@@ -826,52 +894,102 @@ impl AudioEngine {
             }
         }
 
+        // ── drain live MIDI input ring (zero alloc, non-blocking) ─────────
+        while let Some(ev) = self.live_midi_ring.pop() {
+            self.active_note_tracker.track_message(ev.message);
+            self.synth.handle_message(ev.message);
+        }
+
         // ── render audio ───────────────────────────────────────────────────
         let ch = self.channels;
         let frames = output.len() / ch.max(1);
 
         if self.transport_state == transport::PLAYING {
-            // Load the current schedule (one Arc::clone — single atomic increment).
+            // Load the current clip schedule (one Arc::clone — single atomic increment).
             let schedule_opt: Option<Arc<ClipSchedule>> = {
                 let raw = self.schedule_ptr.load(Ordering::Acquire);
                 if raw.is_null() {
                     None
                 } else {
-                    // SAFETY: pointer was stored via Arc::into_raw and is kept
-                    // alive by the UI thread's EngineHandle.
                     let arc = unsafe { Arc::from_raw(raw as *const ClipSchedule) };
                     let cloned = Arc::clone(&arc);
-                    // Forget our reconstructed Arc so we don't decrement the
-                    // refcount — the original pointer still lives in schedule_ptr.
                     std::mem::forget(arc);
                     Some(cloned)
                 }
             };
 
-            // Fill output with sine generator first (tone-generator mode).
-            self.generator.render_interleaved(output, ch);
+            // Load the current MIDI schedule (one Arc::clone — single atomic increment).
+            let midi_schedule_opt: Option<Arc<MidiSchedule>> = {
+                let raw = self.midi_schedule_ptr.load(Ordering::Acquire);
+                if raw.is_null() {
+                    None
+                } else {
+                    let arc = unsafe { Arc::from_raw(raw as *const MidiSchedule) };
+                    let cloned = Arc::clone(&arc);
+                    std::mem::forget(arc);
+                    Some(cloned)
+                }
+            };
 
-            // If a clip schedule is present, mix clips over (or instead of) the sine.
-            if let Some(schedule) = schedule_opt
-                && !schedule.clips.is_empty()
-            {
+            let block_start = self.playhead_frame;
+            let block_end = block_start.saturating_add(frames as u64);
+
+            let has_audio_clips = schedule_opt.as_ref().is_some_and(|s| !s.clips.is_empty());
+            let has_midi_events = midi_schedule_opt
+                .as_ref()
+                .is_some_and(|m| !m.events.is_empty());
+
+            // Trigger scheduled MIDI events in [block_start, block_end).
+            if let Some(ref midi_sched) = midi_schedule_opt {
+                for ev in midi_sched.events_in_range(block_start, block_end) {
+                    self.active_note_tracker.track_message(ev.message);
+                    self.synth.handle_message(ev.message);
+                }
+            }
+
+            if has_audio_clips || has_midi_events || self.synth.has_active_voices() {
                 output.fill(0.0);
+
+                // Render synth into preallocated stereo scratch buffer.
+                let synth_frames = frames.min(self.midi_scratch.len() / 2);
+                let synth_len = synth_frames * 2;
+                if self.synth.has_active_voices() {
+                    self.midi_scratch[..synth_len].fill(0.0);
+                    self.synth
+                        .render_stereo_add(&mut self.midi_scratch[..synth_len], synth_frames);
+                }
 
                 if let Some(ref mut mixer) = self.mixer {
                     mixer.clear_buffers(frames);
-                    for clip in &schedule.clips {
-                        if let Some(ch_buf) = mixer.channel_input_mut(clip.track_id, frames) {
-                            mix_clip_stereo(clip, ch_buf, frames, self.playhead_frame);
-                        } else {
-                            mix_clip(clip, output, frames, ch, self.playhead_frame);
+                    if let Some(ref schedule) = schedule_opt {
+                        for clip in &schedule.clips {
+                            if let Some(ch_buf) = mixer.channel_input_mut(clip.track_id, frames) {
+                                mix_clip_stereo(clip, ch_buf, frames, self.playhead_frame);
+                            } else {
+                                mix_clip(clip, output, frames, ch, self.playhead_frame);
+                            }
                         }
+                    }
+                    if self.synth.has_active_voices() {
+                        mixer.accumulate_direct_master(
+                            &self.midi_scratch[..synth_len],
+                            synth_frames,
+                        );
                     }
                     mixer.process(frames, ch, output);
                 } else {
-                    for clip in &schedule.clips {
-                        mix_clip(clip, output, frames, ch, self.playhead_frame);
+                    if let Some(ref schedule) = schedule_opt {
+                        for clip in &schedule.clips {
+                            mix_clip(clip, output, frames, ch, self.playhead_frame);
+                        }
+                    }
+                    if self.synth.has_active_voices() {
+                        mix_stereo_into_output(&self.midi_scratch[..synth_len], output, frames, ch);
                     }
                 }
+            } else {
+                // Tone-generator fallback mode when project has no audio or MIDI content.
+                self.generator.render_interleaved(output, ch);
             }
 
             // ── advance playhead ───────────────────────────────────────────
@@ -879,6 +997,7 @@ impl AudioEngine {
                 && self.loop_end > self.loop_start
                 && self.playhead_frame + frames as u64 >= self.loop_end
             {
+                self.flush_midi_notes();
                 // Wrap around to loop start.
                 self.loop_start
                     + (self.playhead_frame + frames as u64 - self.loop_end)
@@ -892,6 +1011,14 @@ impl AudioEngine {
                 .store(new_head, Ordering::Release);
         } else {
             output.fill(0.0);
+            if self.synth.has_active_voices() {
+                let synth_frames = frames.min(self.midi_scratch.len() / 2);
+                let synth_len = synth_frames * 2;
+                self.midi_scratch[..synth_len].fill(0.0);
+                self.synth
+                    .render_stereo_add(&mut self.midi_scratch[..synth_len], synth_frames);
+                mix_stereo_into_output(&self.midi_scratch[..synth_len], output, frames, ch);
+            }
         }
 
         // ── mix live input monitoring (real-time safe, zero alloc) ─────────
@@ -961,6 +1088,29 @@ fn mix_clip_stereo(
     playhead_frame: u64,
 ) {
     mix_clip(clip, stereo_output, frames, 2, playhead_frame);
+}
+
+/// Add a stereo scratch buffer into an interleaved `out_channels` output buffer.
+#[inline]
+fn mix_stereo_into_output(stereo: &[f32], output: &mut [f32], frames: usize, out_channels: usize) {
+    let f_max = frames
+        .min(stereo.len() / 2)
+        .min(output.len() / out_channels.max(1));
+    if out_channels == 2 {
+        for i in 0..(f_max * 2) {
+            output[i] += stereo[i];
+        }
+    } else if out_channels == 1 {
+        for f in 0..f_max {
+            output[f] += 0.5 * (stereo[f * 2] + stereo[f * 2 + 1]);
+        }
+    } else if out_channels > 2 {
+        for f in 0..f_max {
+            let base = f * out_channels;
+            output[base] += stereo[f * 2];
+            output[base + 1] += stereo[f * 2 + 1];
+        }
+    }
 }
 
 /// Mix `clip` into `output` for the current block starting at `playhead_frame`.
@@ -1465,5 +1615,43 @@ mod tests {
         engine.process(&mut buf, 0);
         let ph = handle.playhead_frame();
         assert_eq!(ph, 256, "playhead should advance by frame count");
+    }
+
+    #[test]
+    fn test_midi_schedule_plays_synth_and_stop_prevents_stuck_notes() {
+        use esperia_midi::{MidiClip, MidiTrack, PPQN, TempoMap};
+
+        let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
+        let mut track = MidiTrack::new(1, "Keys");
+        let mut clip = MidiClip::new(10, "Chord", 0, PPQN * 4);
+        clip.add_note(0, PPQN * 2, 60, 100, 0);
+        track.clips.push(clip);
+
+        let sched = MidiSchedule::from_tracks(&[track], &TempoMap::constant(120.0), 48_000);
+        handle.set_midi_schedule(Arc::new(sched));
+        handle.play();
+
+        let mut buf = [0.0f32; 1024]; // 512 stereo frames
+        engine.process(&mut buf, 0);
+        let peak: f32 = buf.iter().copied().fold(0.0, |a, s| a.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "MIDI synth should produce audible output: peak={peak}"
+        );
+
+        // Stop transport while note is still active -> must release all notes cleanly
+        handle.stop();
+        for _ in 0..40 {
+            engine.process(&mut buf, 0);
+        }
+        assert!(
+            !engine.active_note_tracker.has_active_notes(),
+            "active note tracker should have no stuck notes after stop"
+        );
+        let tail_peak: f32 = buf.iter().copied().fold(0.0, |a, s| a.max(s.abs()));
+        assert!(
+            tail_peak < 1e-4,
+            "synth voices should decay to silence after stop: tail_peak={tail_peak}"
+        );
     }
 }
