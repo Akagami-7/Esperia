@@ -21,9 +21,9 @@ flowchart TB
     end
 
     subgraph IPC["Lock-Free Inter-Thread Boundary"]
-        CmdQueue["Command RingBuffer (SPSC: UI -> Audio)"]
-        MeterQueue["Telemetry RingBuffer (SPSC: Audio -> UI)"]
-        DiskQueue["Audio Stream Queue (SPSC: Disk -> Audio)"]
+        CmdQueue["Command Queue (bounded MPSC: UI / MIDI -> Audio)"]
+        MeterQueue["Latest-value atomics (Audio -> UI)"]
+        DiskQueue["Planned audio stream queue (not implemented)"]
     end
 
     subgraph Engine_Domain["Audio Domain (Thread: High-Priority Real-Time Callback)"]
@@ -60,34 +60,19 @@ The repository is organized as a Cargo workspace with explicit dependency bounda
 
 ```
 Esperia/
-├── Cargo.toml                     # Root workspace manifest (resolver = "3")
-├── apps/
-│   └── desktop/                   # Esperia desktop binary (GUI, menus, interactions)
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs            # Application entrypoint
-│           ├── app.rs             # Eframe/egui application loop
-│           ├── ui/                # UI panels (Transport, Arrangement, Mixer, Inspector)
-│           └── state.rs           # Client-side presentation state
-├── crates/
-│   ├── audio-engine/              # Real-time audio graph and DSP processing
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs             # Engine API & real-time callback implementation
-│   │       ├── graph.rs           # Track and node evaluation graph
-│   │       ├── mixer.rs           # Channel strips, gain staging, panning laws
-│   │       ├── transport.rs       # Sample-accurate clock, loop logic, playhead
-│   │       └── ringbuffer.rs      # Bounded lock-free ring buffers
-│   └── audio-io/                  # Audio device management & CPAL abstraction
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs             # Device discovery, stream creation
-│           └── device.rs          # Input/output stream configurations & error recovery
-└── docs/                          # Architecture, SRS, PRD, specifications
+├── apps/desktop/                  # eframe/egui shell and application coordinator
+├── crates/audio-io/               # CPAL devices and streams
+├── crates/audio-engine/           # Audio processing and transport
+├── crates/project-model/          # Project entities and persistence
+├── crates/media/                  # Audio decoding and assets
+├── crates/recording/              # Capture and recording workflow
+├── crates/mixer/                  # Mixing and routing calculations
+├── crates/midi/                   # MIDI and musical time
+└── docs/                          # Architecture, specifications, and ADRs
 ```
 
 ### Module Dependency Rules:
-1. `apps/desktop` coordinates both `crates/audio-engine` and `crates/audio-io`.
+1. `apps/desktop` coordinates the project model, UI, audio engine, audio I/O, media, recording, mixer, and MIDI.
 2. `crates/audio-engine` contains pure DSP and synthesis logic and has ZERO dependencies on `audio-io`, CPAL, or GUI.
 3. `crates/audio-io` provides hardware abstraction and has ZERO dependencies on `audio-engine` or `desktop`.
 4. The real-time audio callback in `audio-engine` NEVER references GUI state directly.
@@ -102,8 +87,8 @@ Esperia enforces strict separation between four distinct execution threads:
 | :--- | :--- | :--- | :--- |
 | **Main / UI Thread** | Normal OS Priority | Windowing, user event processing, widget layout, 60 FPS drawing. | May allocate and perform UI operations. Never touches raw audio callback data directly. |
 | **Audio Render Thread** | Real-Time / Audio Priority (`pthread_setschedparam`) | Evaluates timeline clips, applies volume/pan, sums tracks to master, fills hardware output buffer. | **STRICT REAL-TIME SAFETY:**<br>• No memory allocation (`malloc`, `free`, `Vec::push`)<br>• No mutexes, RwLocks, or blocking locks<br>• No file, socket, or console I/O<br>• No thread sleeping or indefinite looping |
-| **Disk I/O Worker** | Low/Background Priority | Pre-reads upcoming audio clips from disk into RAM ring buffers, encodes recorded takes, writes project files. | Allowed to make blocking file system calls. |
-| **Waveform Worker** | Low/Background Priority | Computes min/max peak caches from imported audio files for smooth UI zooming. | Computes asynchronously, dispatches finished mipmaps to UI. |
+| **Media/import workers** | Background | Decode/import work and project file I/O outside the callback. | May perform blocking operations; must not share those operations with the callback. |
+| **Waveform worker** | Planned | Compute min/max peak caches asynchronously. | Not currently implemented as a separate worker. |
 
 ---
 
@@ -112,24 +97,28 @@ Esperia enforces strict separation between four distinct execution threads:
 ```mermaid
 sequenceDiagram
     participant UI as Main / UI Thread
-    participant CmdQ as Lock-Free SPSC Command Queue
+    participant CmdQ as Bounded MPSC Command Queue
     participant Audio as Audio Real-Time Thread
-    participant MeterQ as Lock-Free SPSC Meter Queue
+    participant MeterQ as Atomic Latest-Value Telemetry
 
-    UI->>CmdQ: push(Command::SetTrackVolume { track_id: 1, gain: 0.8 })
+    UI->>CmdQ: try_send(Command::Play)
     Note over Audio: Audio Callback Fires (every 2.67ms)
-    Audio->>CmdQ: pop_all() (non-blocking)
+    Audio->>CmdQ: pop up to 16 commands (non-blocking)
     Audio->>Audio: Process block & calculate peaks
-    Audio->>MeterQ: push(Telemetry { playhead_frame: 44100, peaks: [...] })
+    Audio->>MeterQ: publish latest playhead, peak, and callback metrics
     Note over UI: Next UI Frame (16.6ms)
-    UI->>MeterQ: pop_all() (non-blocking)
-    UI->>UI: Update visual fader meters & playhead cursor
+    UI->>MeterQ: read atomic snapshots (non-blocking)
+    UI->>UI: Update meters & playhead cursor
 ```
 
 ### Communication Invariants:
-1. **Single-Producer Single-Consumer (SPSC):** All channels between threads use bounded, pre-allocated lock-free atomic queues.
-2. **Fixed Memory Footprint:** The command queue and telemetry queue are allocated at startup with fixed capacities (e.g., 1024 messages).
-3. **Drop Policy:** If telemetry queues fill up (e.g. UI freezes for a moment), the audio thread drops the oldest telemetry frame; it NEVER blocks waiting for the UI to consume.
+1. **Bounded channels:** Audio-facing queues are preallocated and expose explicit full/empty results. The command producer never overwrites unread commands.
+2. **Callback budget:** The callback processes a fixed maximum number of control commands per block; sample work is bounded by the device buffer length.
+3. **Telemetry policy:** Single-value metrics use latest-value atomics. Queue-backed telemetry discards the newest update when full; only its consumer advances the read cursor.
+4. **Schedule lifetime:** Callback readers hold a guarded borrowed snapshot. The publisher retains old snapshots until readers are quiescent and reclaims them off the callback. Publication rejects updates at the fixed limit of 64 retained snapshots per schedule type.
+5. **Mixer graph lifetime:** One pending and one retired graph slot are used. If retirement is occupied, replacement is deferred; the callback does not allocate or drop the old graph.
+6. **Work bounds:** A callback processes at most 128 live MIDI events and 256 scheduled MIDI events per block. A MIDI backlog is preserved and counted in telemetry. Clip schedules cap at 4,096 clips; MIDI schedules at 1,000,000 events; mixer graphs at 4,096 channels, 512 buses, 8,192 sends, and 16,384 frames per preallocated buffer.
+7. **Verification limits:** Saturation and ownership tests exist, but hardware timing and sustained stress behavior still require profiling before claiming production real-time performance.
 
 ---
 
@@ -150,6 +139,8 @@ flowchart LR
     Limiter --> OutputDither["Dither / Float-to-Int conversion"]
     OutputDither --> DeviceOut["Hardware DAC"]
 ```
+
+The diagram is the target signal path; a production limiter and output dither are not currently implemented.
 
 ### Signal Math:
 - **Audio Sample Representation:** `f32` normalized to $[-1.0, +1.0]$, allowing intermediate mixing headroom up to $+770\text{ dB}$ before clipping.
@@ -211,8 +202,8 @@ MySong.esperia/
 | ADR ID | Decision Title | Status | Rationale |
 | :--- | :--- | :--- | :--- |
 | **ADR-0001** | Rust as Primary Language | Accepted | Memory safety without garbage collection pauses; zero-cost abstractions; fearless concurrency. |
-| **ADR-0002** | Immediate/Retained GUI Selection | Accepted | `eframe` (egui) / `vizia` allows immediate visual prototyping and fast GPU rendering with minimal boilerplate. |
+| **ADR-0002** | Desktop UI and Rendering | Accepted | eframe/egui uses one shared window, input, and wgpu rendering stack. |
 | **ADR-0003** | CPAL for Audio I/O | Accepted | Native multi-platform hardware binding for CoreAudio, WASAPI, and ALSA/Pulse. |
 | **ADR-0004** | Cargo Workspace Architecture | Accepted | Enforces clean crate boundaries between UI, engine, and hardware abstraction. |
-| **ADR-0005** | Strict Audio Thread Isolation | Accepted | Eliminates priority inversion, dropouts, and UI stalls by banning allocations/mutexes in the callback. |
+| **ADR-0005** | Strict Audio Thread Isolation | Accepted | Defines callback constraints, bounded queues, and off-thread reclamation rules. |
 | **ADR-0006** | Directory-Bundle Project Format | Accepted | Simplifies portability, backup, and sample referencing while keeping manifests human-readable. |

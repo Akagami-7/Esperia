@@ -1,7 +1,9 @@
 [package]
 name = "esperia-project-model"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 esperia-midi = { path = "../midi" }
@@ -10,3 +12,6 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints]
+workspace = true

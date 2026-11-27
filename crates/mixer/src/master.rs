@@ -37,8 +37,8 @@ impl MasterChannel {
     #[inline]
     pub fn accumulate(&mut self, src: &[f32], frames: usize) {
         let len = (frames * 2).min(self.buffer.len()).min(src.len());
-        for i in 0..len {
-            self.buffer[i] += src[i];
+        for (destination, source) in self.buffer.iter_mut().zip(src).take(len) {
+            *destination += source;
         }
     }
 

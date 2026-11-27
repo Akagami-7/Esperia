@@ -1,4 +1,4 @@
-# ADR-0009: Media Crate, Symphonia Decoding, and Lock-Free Clip Scheduling
+# ADR-0009: Media Decoding and Schedule Ownership
 
 - **Status:** Accepted
 - **Date:** 2026-11-25
@@ -21,9 +21,10 @@ Step 3 transitions Esperia from a single-tone generator to a multitrack DAW capa
 3. **Linear Resampling**:
    - `resample_linear` converts mismatched source sample rates to the active engine sample rate during background import so the real-time callback never performs per-sample rate conversion.
    - A windowed-sinc resampler (e.g., `rubato`) can replace `resample_linear` later without API changes.
-4. **Lock-Free Clip Schedule Transfer**:
-   - The UI thread builds an immutable `Arc<ClipSchedule>` containing `ScheduledClip` entries (referencing `Arc<Vec<f32>>` decoded buffers) and publishes it to `AudioEngine` via `AtomicPtr::swap`.
-   - The audio callback reads the pointer with `Acquire` ordering and performs a single atomic refcount increment (`Arc::clone`), avoiding allocations and mutexes on the real-time path.
+4. **Immutable Schedule Publication**:
+   - The UI thread builds immutable clip and MIDI schedules off the callback.
+   - `ScheduleStorage` publishes a versioned pointer protected by a sequentially consistent reader guard. The callback borrows schedule data without cloning or dropping `Arc`s.
+   - The publisher retains old versions until readers are quiescent, then reclaims them off the callback. A fixed cap of 64 retained versions rejects excess updates instead of freeing callback-visible data.
 
 ## Consequences
 

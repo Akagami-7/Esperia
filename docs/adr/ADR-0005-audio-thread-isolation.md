@@ -12,17 +12,17 @@ Standard application programming patterns rely on dynamic heap allocation (`mall
 ## Alternatives
 1. **Standard `Mutex` / `RwLock` shared state:** Simple to write, but fatal for real-time audio due to priority inversion and unpredictable blocking duration.
 2. **Actor Model / Channel Message Passing:** Using standard channels (`crossbeam`, `std::sync::mpsc`) which may allocate internally under high message loads.
-3. **Lock-Free Bounded Ringbuffers (SPSC):** Pre-allocated, wait-free Single-Producer Single-Consumer queues with atomic head and tail pointers.
+3. **Bounded lock-free queues and atomic snapshots:** Preallocated MPSC/SPSC queues are used where messages are required; latest-value metrics use atomics.
 
 ## Chosen Decision
-We enforce **strict real-time audio thread isolation**:
-- The audio callback thread NEVER performs heap allocations, acquires OS mutexes, performs disk/network I/O, or makes blocking calls.
-- Inter-thread communication between UI and the audio engine operates strictly via bounded, pre-allocated lock-free ringbuffers (SPSC) and atomic variables.
+The audio callback must not allocate or deallocate, acquire blocking locks, perform file/network/console I/O, or wait on another thread. Processing and command draining have explicit bounds. Queue saturation has a defined result and may not overwrite unread data.
+
+Clip and MIDI schedules are immutable snapshots read through a callback guard. The publisher retains prior versions until readers are quiescent, then reclaims them outside the callback; a fixed retention cap rejects excess updates. Mixer graphs use one pending pointer slot and one retired pointer slot. If the retired slot is occupied, the callback defers replacement and keeps the active graph. Raw pointers require these explicit ownership/lifetime protocols; an `Arc` refcount increment after an unprotected pointer load is unsafe.
 
 ## Consequences
-- **Positive:** Mathematically deterministic audio callback timing, complete immunity to UI stalls, and zero dropouts caused by garbage collection or lock contention.
-- **Negative:** Requires disciplined software design: all scratch memory must be pre-allocated, and state synchronization must be modeled through non-blocking command queues.
+- **Positive:** Makes callback work and ownership transitions auditable and prevents UI stalls from blocking audio.
+- **Negative:** Bounded queues can reject updates; callers must report or retry them outside the callback. This policy is not a claim that all current engine paths already meet the rule.
 
 ## Future Reconsideration Conditions
-None. This is a non-negotiable core invariant of Esperia.
+Revisit only if measured requirements show that a different, equally safe ownership model is needed.
 

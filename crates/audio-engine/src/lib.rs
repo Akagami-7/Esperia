@@ -4,15 +4,11 @@
 //! * This crate has **zero** dependency on `cpal`, `esperia-audio-io`, or any GUI crate.
 //! * Every public function that enters the audio callback is real-time safe:
 //!   no heap allocation, no blocking synchronisation, no I/O.
-//! * Cross-thread communication uses lock-free atomics and a bounded SPSC ring.
+//! * Engine commands use a bounded MPSC queue; audio samples and MIDI input use
+//!   bounded SPSC rings.
 //!
-//! # Step 3 additions
-//! * `Pause`, `Seek`, `SetLoopRegion`, `EnableLoop` commands.
-//! * `ClipSchedule` — the UI thread passes an `Arc<Vec<ScheduledClip>>` to the
-//!   engine via `AtomicPtr` (lock-free ownership transfer).
-//! * `playhead_frame` in `EngineTelemetry` for UI position display.
-//! * `ScheduledClip` holds an `Arc<DecodedSamples>` (a type-alias for
-//!   `Arc<Vec<f32>>`) so the callback can read decoded audio without allocation.
+//! Schedules are still under the ownership audit; see the Phase 0 architecture
+//! notes before treating schedule publication as real-time safe.
 
 pub mod synth;
 
@@ -20,10 +16,10 @@ use esperia_midi::{ActiveNoteTracker, InstrumentKind, MidiInputRing, MidiMessage
 use esperia_mixer::{MixerGraph, MixerMeters};
 use std::cell::UnsafeCell;
 use std::f32::consts::TAU;
-use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
+use std::sync::{Arc, Mutex};
 use synth::PolySynth;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,8 +30,14 @@ use synth::PolySynth;
 /// The audio callback reads this without any allocation.
 pub type DecodedSamples = Arc<Vec<f32>>;
 
+const COMMAND_PROCESSING_BUDGET: usize = 16;
+const LIVE_MIDI_PROCESSING_BUDGET: usize = 128;
+const SCHEDULED_MIDI_EVENT_BUDGET: usize = 256;
+const MAX_CLIPS_PER_SCHEDULE: usize = 4096;
+const MAX_MIDI_EVENTS_PER_SCHEDULE: usize = 1_000_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// SPSC Command ring
+// Bounded MPSC Command ring
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Commands that the UI thread sends to the audio engine.
@@ -66,6 +68,35 @@ pub enum EngineCommand {
     /// Enable or disable live input monitoring pass-through.
     EnableInputMonitoring(bool),
 }
+
+/// A bounded engine queue rejected a command; callers can report or retry this
+/// on a non-real-time thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueError {
+    /// All queue slots are occupied.
+    Full,
+    /// A producer could not claim a slot within the bounded retry budget.
+    Contended,
+    /// The callback is still reading retained schedules, exhausting the cap.
+    ScheduleRetentionFull,
+    /// A schedule exceeds the fixed project processing bound.
+    ScheduleTooLarge,
+}
+
+impl std::fmt::Display for QueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => f.write_str("audio command queue is full"),
+            Self::Contended => f.write_str("audio command queue is contended"),
+            Self::ScheduleRetentionFull => {
+                f.write_str("audio schedule retirement capacity is full")
+            }
+            Self::ScheduleTooLarge => f.write_str("schedule exceeds the audio processing limit"),
+        }
+    }
+}
+
+impl std::error::Error for QueueError {}
 
 impl EngineCommand {
     fn encode(self) -> [u32; 4] {
@@ -164,8 +195,8 @@ impl MonitorRing {
         }
     }
 
-    /// Push captured samples from the input callback (real-time safe, drops oldest
-    /// excess if full rather than blocking).
+    /// Push captured samples from the input callback (real-time safe, drops
+    /// newest excess if full rather than overwriting unread samples).
     #[inline]
     pub fn push_samples(&self, samples: &[f32]) {
         let head = self.head.load(Ordering::Relaxed);
@@ -200,13 +231,27 @@ impl MonitorRing {
     }
 }
 
-/// Bounded, wait-free SPSC command ring.
+/// Bounded MPSC command queue with a single audio-thread consumer.
 ///
-/// Slots are `[u32; 4]` (upgraded from `[u32; 3]` to hold 64-bit frame indices).
+/// Slot sequence numbers reserve each slot and publish writes without locks.
 struct CommandRing<const N: usize> {
-    slots: Box<[[AtomicU32; 4]; N]>,
+    slots: [CommandSlot; N],
     head: AtomicUsize,
     tail: AtomicUsize,
+}
+
+struct CommandSlot {
+    sequence: AtomicUsize,
+    words: [AtomicU32; 4],
+}
+
+impl CommandSlot {
+    fn new(sequence: usize) -> Self {
+        Self {
+            sequence: AtomicUsize::new(sequence),
+            words: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
 }
 
 impl<const N: usize> CommandRing<N> {
@@ -215,49 +260,61 @@ impl<const N: usize> CommandRing<N> {
             N.is_power_of_two(),
             "CommandRing capacity must be a power of two"
         );
-        let slots: Vec<[AtomicU32; 4]> = (0..N)
-            .map(|_| {
-                [
-                    AtomicU32::new(0),
-                    AtomicU32::new(0),
-                    AtomicU32::new(0),
-                    AtomicU32::new(0),
-                ]
-            })
-            .collect();
         Self {
-            slots: slots.into_boxed_slice().try_into().ok().unwrap(),
+            slots: std::array::from_fn(CommandSlot::new),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
     }
 
-    fn push(&self, cmd: EngineCommand) {
+    fn try_push(&self, cmd: EngineCommand) -> Result<(), QueueError> {
         let raw = cmd.encode();
-        let head = self.head.load(Ordering::Relaxed);
-        let slot = head & (N - 1);
-        self.slots[slot][0].store(raw[0], Ordering::Relaxed);
-        self.slots[slot][1].store(raw[1], Ordering::Relaxed);
-        self.slots[slot][2].store(raw[2], Ordering::Relaxed);
-        self.slots[slot][3].store(raw[3], Ordering::Release);
-        self.head.store(head.wrapping_add(1), Ordering::Release);
+        let mut position = self.head.load(Ordering::Relaxed);
+
+        for _ in 0..8 {
+            let slot = &self.slots[position & (N - 1)];
+            let sequence = slot.sequence.load(Ordering::Acquire);
+            let difference = sequence.wrapping_sub(position) as isize;
+
+            if difference == 0 {
+                match self.head.compare_exchange_weak(
+                    position,
+                    position.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        for (word, value) in slot.words.iter().zip(raw) {
+                            word.store(value, Ordering::Relaxed);
+                        }
+                        slot.sequence
+                            .store(position.wrapping_add(1), Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(actual) => position = actual,
+                }
+            } else if difference < 0 {
+                return Err(QueueError::Full);
+            } else {
+                position = self.head.load(Ordering::Relaxed);
+            }
+        }
+
+        Err(QueueError::Contended)
     }
 
     fn pop(&self) -> Option<EngineCommand> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if tail == head {
+        let position = self.tail.load(Ordering::Relaxed);
+        let slot = &self.slots[position & (N - 1)];
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        let difference = sequence.wrapping_sub(position.wrapping_add(1)) as isize;
+        if difference != 0 {
             return None;
         }
-        let slot = tail & (N - 1);
-        let _ = self.slots[slot][3].load(Ordering::Acquire);
-        let raw = [
-            self.slots[slot][0].load(Ordering::Relaxed),
-            self.slots[slot][1].load(Ordering::Relaxed),
-            self.slots[slot][2].load(Ordering::Relaxed),
-            self.slots[slot][3].load(Ordering::Relaxed),
-        ];
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        let raw = std::array::from_fn(|index| slot.words[index].load(Ordering::Relaxed));
+        slot.sequence
+            .store(position.wrapping_add(N), Ordering::Release);
+        self.tail.store(position.wrapping_add(1), Ordering::Relaxed);
         EngineCommand::decode(raw)
     }
 }
@@ -298,6 +355,115 @@ pub struct ClipSchedule {
     pub clips: Vec<ScheduledClip>,
 }
 
+const MAX_RETAINED_SCHEDULES: usize = 64;
+
+/// Keeps immutable schedules alive while the audio callback reads their raw
+/// address. Reclamation happens only on the publishing/UI side.
+struct ScheduleStorage<T> {
+    active: AtomicPtr<ScheduleVersion<T>>,
+    readers: AtomicUsize,
+    next_generation: AtomicUsize,
+    retained: Mutex<Vec<Arc<ScheduleVersion<T>>>>,
+}
+
+struct ScheduleVersion<T> {
+    generation: usize,
+    schedule: Arc<T>,
+}
+
+impl<T: Send + Sync> ScheduleStorage<T> {
+    fn new() -> Self {
+        Self {
+            active: AtomicPtr::new(std::ptr::null_mut()),
+            readers: AtomicUsize::new(0),
+            next_generation: AtomicUsize::new(1),
+            retained: Mutex::new(Vec::with_capacity(MAX_RETAINED_SCHEDULES)),
+        }
+    }
+
+    fn read(&self) -> ScheduleReadGuard<'_, T> {
+        // Sequential consistency pairs with publication/reclamation below. It
+        // prevents a publisher from observing zero readers and freeing an old
+        // schedule while a callback can still load its pointer.
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let pointer = self.active.load(Ordering::SeqCst);
+        ScheduleReadGuard {
+            storage: self,
+            pointer,
+        }
+    }
+
+    fn publish(&self, schedule: Arc<T>) -> Result<(), QueueError> {
+        let mut retained = self
+            .retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reclaim_if_quiescent(&mut retained);
+
+        if retained.len() == MAX_RETAINED_SCHEDULES {
+            return Err(QueueError::ScheduleRetentionFull);
+        }
+
+        let version = Arc::new(ScheduleVersion {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            schedule,
+        });
+        let pointer = Arc::as_ptr(&version) as *mut ScheduleVersion<T>;
+        retained.push(version);
+        self.active.store(pointer, Ordering::SeqCst);
+        self.reclaim_if_quiescent(&mut retained);
+        Ok(())
+    }
+
+    fn reclaim(&self) {
+        let mut retained = self
+            .retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reclaim_if_quiescent(&mut retained);
+    }
+
+    fn reclaim_if_quiescent(&self, retained: &mut Vec<Arc<ScheduleVersion<T>>>) {
+        if self.readers.load(Ordering::SeqCst) == 0 {
+            let active = self.active.load(Ordering::SeqCst);
+            retained.retain(|version| std::ptr::eq(Arc::as_ptr(version), active));
+        }
+    }
+}
+
+struct ScheduleReadGuard<'a, T> {
+    storage: &'a ScheduleStorage<T>,
+    pointer: *mut ScheduleVersion<T>,
+}
+
+impl<T> ScheduleReadGuard<'_, T> {
+    fn get(&self) -> Option<&T> {
+        if self.pointer.is_null() {
+            None
+        } else {
+            // SAFETY: ScheduleStorage retains every published Arc while any
+            // reader is active. The guard increments the reader count before
+            // loading this pointer and keeps it incremented for this borrow.
+            Some(unsafe { &(*self.pointer).schedule })
+        }
+    }
+
+    fn generation(&self) -> Option<usize> {
+        if self.pointer.is_null() {
+            None
+        } else {
+            // SAFETY: the reader guard keeps this published version alive.
+            Some(unsafe { (*self.pointer).generation })
+        }
+    }
+}
+
+impl<T> Drop for ScheduleReadGuard<'_, T> {
+    fn drop(&mut self) {
+        self.storage.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TransportState
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,6 +496,12 @@ pub struct EngineTelemetry {
     pub playhead_frame: AtomicU64,
     /// Transport state: 0=stopped, 1=playing, 2=paused.
     pub transport_state: AtomicU8,
+    /// Commands rejected because the bounded queue was full or contended.
+    pub command_queue_rejections: AtomicU64,
+    /// Schedule updates rejected while callback readers prevent reclamation.
+    pub schedule_update_rejections: AtomicU64,
+    /// Scheduled MIDI events deferred because a block exceeded its event budget.
+    pub deferred_midi_event_blocks: AtomicU64,
 }
 
 impl EngineTelemetry {
@@ -342,6 +514,9 @@ impl EngineTelemetry {
             is_playing: AtomicBool::new(false),
             playhead_frame: AtomicU64::new(0),
             transport_state: AtomicU8::new(transport::STOPPED),
+            command_queue_rejections: AtomicU64::new(0),
+            schedule_update_rejections: AtomicU64::new(0),
+            deferred_midi_event_blocks: AtomicU64::new(0),
         }
     }
 
@@ -496,10 +671,9 @@ pub struct EngineHandle {
     commands: Arc<CommandRing<64>>,
     /// Shared telemetry — readable any time by the UI thread.
     pub telemetry: Arc<EngineTelemetry>,
-    /// Lock-free pointer to the current `ClipSchedule`.
-    schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
-    /// Lock-free pointer to the current `MidiSchedule`.
-    midi_schedule_ptr: Arc<AtomicPtr<MidiSchedule>>,
+    /// Schedule storage is reclaimed by non-real-time calls to `reclaim_schedules`.
+    clip_schedule: Arc<ScheduleStorage<ClipSchedule>>,
+    midi_schedule: Arc<ScheduleStorage<MidiSchedule>>,
     /// Lock-free pointer for pushing a newly-built `MixerGraph` to the audio thread.
     pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Lock-free pointer for returning a retired `MixerGraph` to the UI thread for drop.
@@ -511,21 +685,34 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Send a command to the audio engine. Wait-free; never panics.
-    pub fn send(&self, cmd: EngineCommand) {
-        self.commands.push(cmd);
+    /// Attempt to send a command. Full and contention are reported to the caller.
+    pub fn try_send(&self, cmd: EngineCommand) -> Result<(), QueueError> {
+        self.commands.try_push(cmd)
+    }
+
+    /// Compatibility alias for [`EngineHandle::try_send`].
+    pub fn send(&self, cmd: EngineCommand) -> Result<(), QueueError> {
+        self.try_send(cmd)
+    }
+
+    fn enqueue_from_ui(&self, cmd: EngineCommand) {
+        if self.try_send(cmd).is_err() {
+            self.telemetry
+                .command_queue_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn play(&self) {
-        self.send(EngineCommand::Play);
+        self.enqueue_from_ui(EngineCommand::Play);
     }
 
     pub fn stop(&self) {
-        self.send(EngineCommand::Stop);
+        self.enqueue_from_ui(EngineCommand::Stop);
     }
 
     pub fn pause(&self) {
-        self.send(EngineCommand::Pause);
+        self.enqueue_from_ui(EngineCommand::Pause);
     }
 
     pub fn toggle_play(&self) -> bool {
@@ -544,19 +731,19 @@ impl EngineHandle {
     }
 
     pub fn seek(&self, frame: u64) {
-        self.send(EngineCommand::Seek { frame });
+        self.enqueue_from_ui(EngineCommand::Seek { frame });
     }
 
     pub fn set_loop_region(&self, start: u64, end: u64) {
-        self.send(EngineCommand::SetLoopRegion { start, end });
+        self.enqueue_from_ui(EngineCommand::SetLoopRegion { start, end });
     }
 
     pub fn enable_loop(&self, enabled: bool) {
-        self.send(EngineCommand::EnableLoop(enabled));
+        self.enqueue_from_ui(EngineCommand::EnableLoop(enabled));
     }
 
     pub fn set_input_monitoring(&self, enabled: bool) {
-        self.send(EngineCommand::EnableInputMonitoring(enabled));
+        self.enqueue_from_ui(EngineCommand::EnableInputMonitoring(enabled));
     }
 
     pub fn monitor_ring(&self) -> Arc<MonitorRing> {
@@ -573,46 +760,57 @@ impl EngineHandle {
         let _ = self.live_midi_ring.push(msg);
     }
 
-    /// Replace the MIDI schedule lock-free.
-    pub fn set_midi_schedule(&self, schedule: Arc<MidiSchedule>) {
-        let new_raw = Arc::into_raw(schedule) as *mut MidiSchedule;
-        let old_raw = self.midi_schedule_ptr.swap(new_raw, Ordering::AcqRel);
-        if !old_raw.is_null() {
-            // SAFETY: we own the raw pointer because we stored it here originally.
-            let _ = unsafe { Arc::from_raw(old_raw as *const MidiSchedule) };
+    /// Publish an immutable MIDI schedule. The prior schedule remains alive
+    /// until the audio callback finishes its current block.
+    pub fn set_midi_schedule(&self, schedule: Arc<MidiSchedule>) -> Result<(), QueueError> {
+        let result = if schedule.events.len() > MAX_MIDI_EVENTS_PER_SCHEDULE {
+            Err(QueueError::ScheduleTooLarge)
+        } else {
+            self.midi_schedule.publish(schedule)
+        };
+        if result.is_err() {
+            self.telemetry
+                .schedule_update_rejections
+                .fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     pub fn set_frequency(&self, hz: f32) {
-        self.send(EngineCommand::SetFrequency(hz));
+        self.enqueue_from_ui(EngineCommand::SetFrequency(hz));
     }
 
     pub fn set_amplitude(&self, amp: f32) {
-        self.send(EngineCommand::SetAmplitude(amp));
+        self.enqueue_from_ui(EngineCommand::SetAmplitude(amp));
     }
 
     pub fn reconfigure(&self, sample_rate: f32, channels: u16) {
-        self.send(EngineCommand::Reconfigure {
+        self.enqueue_from_ui(EngineCommand::Reconfigure {
             sample_rate,
             channels,
         });
     }
 
-    /// Replace the clip schedule.  Lock-free: the old schedule is dropped on
-    /// the UI thread after the swap.
-    ///
-    /// # Safety contract
-    /// The audio callback reads the pointer with `Acquire` ordering and clones
-    /// the Arc once per block — this is a single atomic increment, not a heap
-    /// allocation.
-    pub fn set_clip_schedule(&self, schedule: Arc<ClipSchedule>) {
-        let new_raw = Arc::into_raw(schedule) as *mut ClipSchedule;
-        let old_raw = self.schedule_ptr.swap(new_raw, Ordering::AcqRel);
-        // Drop the old schedule on the UI thread.
-        if !old_raw.is_null() {
-            // SAFETY: we own the raw pointer because we stored it here originally.
-            let _ = unsafe { Arc::from_raw(old_raw as *const ClipSchedule) };
+    /// Publish an immutable clip schedule. The prior schedule remains alive
+    /// until the audio callback finishes its current block.
+    pub fn set_clip_schedule(&self, schedule: Arc<ClipSchedule>) -> Result<(), QueueError> {
+        let result = if schedule.clips.len() > MAX_CLIPS_PER_SCHEDULE {
+            Err(QueueError::ScheduleTooLarge)
+        } else {
+            self.clip_schedule.publish(schedule)
+        };
+        if result.is_err() {
+            self.telemetry
+                .schedule_update_rejections
+                .fetch_add(1, Ordering::Relaxed);
         }
+        result
+    }
+
+    /// Reclaim retired schedule snapshots from a non-real-time thread.
+    pub fn reclaim_schedules(&self) {
+        self.clip_schedule.reclaim();
+        self.midi_schedule.reclaim();
     }
 
     /// Replace the mixer routing graph lock-free.
@@ -647,25 +845,6 @@ impl EngineHandle {
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
-        // If this is the last handle, free the schedule pointer.
-        // Arc::strong_count is not available without an Arc reference, so we
-        // check if our schedule_ptr Arc has only one reference left.
-        if Arc::strong_count(&self.schedule_ptr) == 1 {
-            let raw = self
-                .schedule_ptr
-                .swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !raw.is_null() {
-                let _ = unsafe { Arc::from_raw(raw as *const ClipSchedule) };
-            }
-        }
-        if Arc::strong_count(&self.midi_schedule_ptr) == 1 {
-            let raw = self
-                .midi_schedule_ptr
-                .swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !raw.is_null() {
-                let _ = unsafe { Arc::from_raw(raw as *const MidiSchedule) };
-            }
-        }
         if Arc::strong_count(&self.pending_mixer_ptr) == 1 {
             let raw = self
                 .pending_mixer_ptr
@@ -708,12 +887,12 @@ pub struct AudioEngine {
     loop_end: u64,
     loop_enabled: bool,
     input_monitoring_enabled: bool,
-    /// Shared pointer to the current clip schedule.
-    schedule_ptr: Arc<AtomicPtr<ClipSchedule>>,
-    /// Shared pointer to the current MIDI schedule.
-    midi_schedule_ptr: Arc<AtomicPtr<MidiSchedule>>,
+    /// Immutable snapshots, reclaimed outside the callback.
+    clip_schedule: Arc<ScheduleStorage<ClipSchedule>>,
+    midi_schedule: Arc<ScheduleStorage<MidiSchedule>>,
     /// Active mixer routing graph (owned exclusively by audio thread).
-    mixer: Option<MixerGraph>,
+    mixer: Option<Box<MixerGraph>>,
+    deferred_mixer: Option<Box<MixerGraph>>,
     pending_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     retired_mixer_ptr: Arc<AtomicPtr<MixerGraph>>,
     /// Preallocated SPSC ring for live input monitoring.
@@ -728,6 +907,9 @@ pub struct AudioEngine {
     active_note_tracker: ActiveNoteTracker,
     /// Preallocated stereo scratch buffer for MIDI synth rendering.
     midi_scratch: Vec<f32>,
+    midi_schedule_identity: usize,
+    midi_event_cursor: usize,
+    midi_cursor_needs_rebuild: bool,
 }
 
 impl AudioEngine {
@@ -737,8 +919,8 @@ impl AudioEngine {
         let sr = sample_rate.max(1.0);
         let commands = Arc::new(CommandRing::<64>::new());
         let telemetry = Arc::new(EngineTelemetry::new());
-        let schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
-        let midi_schedule_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let clip_schedule = Arc::new(ScheduleStorage::new());
+        let midi_schedule = Arc::new(ScheduleStorage::new());
         let pending_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let retired_mixer_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let monitor_ring = Arc::new(MonitorRing::new(16_384));
@@ -747,8 +929,8 @@ impl AudioEngine {
         let handle = EngineHandle {
             commands: Arc::clone(&commands),
             telemetry: Arc::clone(&telemetry),
-            schedule_ptr: Arc::clone(&schedule_ptr),
-            midi_schedule_ptr: Arc::clone(&midi_schedule_ptr),
+            clip_schedule: Arc::clone(&clip_schedule),
+            midi_schedule: Arc::clone(&midi_schedule),
             pending_mixer_ptr: Arc::clone(&pending_mixer_ptr),
             retired_mixer_ptr: Arc::clone(&retired_mixer_ptr),
             monitor_ring: Arc::clone(&monitor_ring),
@@ -773,9 +955,10 @@ impl AudioEngine {
             loop_end: u64::MAX,
             loop_enabled: false,
             input_monitoring_enabled: false,
-            schedule_ptr,
-            midi_schedule_ptr,
+            clip_schedule,
+            midi_schedule,
             mixer: None,
+            deferred_mixer: None,
             pending_mixer_ptr,
             retired_mixer_ptr,
             monitor_ring,
@@ -784,6 +967,9 @@ impl AudioEngine {
             synth: PolySynth::new(0, InstrumentKind::ElectricPiano, sr),
             active_note_tracker: ActiveNoteTracker::new(),
             midi_scratch,
+            midi_schedule_identity: 0,
+            midi_event_cursor: 0,
+            midi_cursor_needs_rebuild: true,
         };
 
         (engine, handle)
@@ -809,7 +995,7 @@ impl AudioEngine {
     /// **Audio callback entry point.**
     ///
     /// # Real-time safety contract
-    /// * No heap allocation (preallocated scratch is used; Arc::clone is one atomic).
+    /// * No heap allocation or deallocation (schedule reads borrow retained snapshots).
     /// * No blocking synchronisation.
     /// * No I/O.
     /// * Bounded iteration proportional to `output.len()`.
@@ -824,7 +1010,10 @@ impl AudioEngine {
         };
 
         // ── drain commands (non-blocking) ──────────────────────────────────
-        while let Some(cmd) = self.commands.pop() {
+        for _ in 0..COMMAND_PROCESSING_BUDGET {
+            let Some(cmd) = self.commands.pop() else {
+                break;
+            };
             match cmd {
                 EngineCommand::Play => {
                     self.transport_state = transport::PLAYING;
@@ -839,6 +1028,7 @@ impl AudioEngine {
                     self.generator.set_playing(false);
                     self.flush_midi_notes();
                     self.playhead_frame = 0;
+                    self.midi_cursor_needs_rebuild = true;
                     self.telemetry.is_playing.store(false, Ordering::Release);
                     self.telemetry
                         .transport_state
@@ -857,6 +1047,7 @@ impl AudioEngine {
                 EngineCommand::Seek { frame } => {
                     self.flush_midi_notes();
                     self.playhead_frame = frame;
+                    self.midi_cursor_needs_rebuild = true;
                     self.telemetry
                         .playhead_frame
                         .store(frame, Ordering::Release);
@@ -882,20 +1073,13 @@ impl AudioEngine {
             }
         }
 
-        // ── swap pending mixer graph if UI published a new one ─────────────
-        let incoming_mixer = self
-            .pending_mixer_ptr
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !incoming_mixer.is_null() {
-            let new_mixer = unsafe { *Box::from_raw(incoming_mixer) };
-            if let Some(old_mixer) = self.mixer.replace(new_mixer) {
-                let old_raw = Box::into_raw(Box::new(old_mixer));
-                let _ = self.retired_mixer_ptr.swap(old_raw, Ordering::AcqRel);
-            }
-        }
+        self.apply_pending_mixer();
 
         // ── drain live MIDI input ring (zero alloc, non-blocking) ─────────
-        while let Some(ev) = self.live_midi_ring.pop() {
+        for _ in 0..LIVE_MIDI_PROCESSING_BUDGET {
+            let Some(ev) = self.live_midi_ring.pop() else {
+                break;
+            };
             self.active_note_tracker.track_message(ev.message);
             self.synth.handle_message(ev.message);
         }
@@ -905,45 +1089,47 @@ impl AudioEngine {
         let frames = output.len() / ch.max(1);
 
         if self.transport_state == transport::PLAYING {
-            // Load the current clip schedule (one Arc::clone — single atomic increment).
-            let schedule_opt: Option<Arc<ClipSchedule>> = {
-                let raw = self.schedule_ptr.load(Ordering::Acquire);
-                if raw.is_null() {
-                    None
-                } else {
-                    let arc = unsafe { Arc::from_raw(raw as *const ClipSchedule) };
-                    let cloned = Arc::clone(&arc);
-                    std::mem::forget(arc);
-                    Some(cloned)
-                }
-            };
+            let schedule_guard = self.clip_schedule.read();
+            let midi_schedule_guard = self.midi_schedule.read();
+            let schedule_opt = schedule_guard.get();
+            let midi_schedule_opt = midi_schedule_guard.get();
 
-            // Load the current MIDI schedule (one Arc::clone — single atomic increment).
-            let midi_schedule_opt: Option<Arc<MidiSchedule>> = {
-                let raw = self.midi_schedule_ptr.load(Ordering::Acquire);
-                if raw.is_null() {
-                    None
-                } else {
-                    let arc = unsafe { Arc::from_raw(raw as *const MidiSchedule) };
-                    let cloned = Arc::clone(&arc);
-                    std::mem::forget(arc);
-                    Some(cloned)
-                }
-            };
+            let schedule_identity = midi_schedule_guard.generation().unwrap_or(0);
+            if schedule_identity != self.midi_schedule_identity || self.midi_cursor_needs_rebuild {
+                self.midi_schedule_identity = schedule_identity;
+                self.midi_event_cursor = midi_schedule_opt.map_or(0, |schedule| {
+                    schedule
+                        .events
+                        .partition_point(|event| event.sample_frame < self.playhead_frame)
+                });
+                self.midi_cursor_needs_rebuild = false;
+            }
 
             let block_start = self.playhead_frame;
             let block_end = block_start.saturating_add(frames as u64);
 
-            let has_audio_clips = schedule_opt.as_ref().is_some_and(|s| !s.clips.is_empty());
-            let has_midi_events = midi_schedule_opt
-                .as_ref()
-                .is_some_and(|m| !m.events.is_empty());
+            let has_audio_clips = schedule_opt.is_some_and(|s| !s.clips.is_empty());
+            let has_midi_events = midi_schedule_opt.is_some_and(|m| !m.events.is_empty());
 
             // Trigger scheduled MIDI events in [block_start, block_end).
-            if let Some(ref midi_sched) = midi_schedule_opt {
-                for ev in midi_sched.events_in_range(block_start, block_end) {
+            if let Some(midi_sched) = midi_schedule_opt {
+                let mut processed = 0;
+                while self.midi_event_cursor < midi_sched.events.len()
+                    && midi_sched.events[self.midi_event_cursor].sample_frame < block_end
+                    && processed < SCHEDULED_MIDI_EVENT_BUDGET
+                {
+                    let ev = midi_sched.events[self.midi_event_cursor];
                     self.active_note_tracker.track_message(ev.message);
                     self.synth.handle_message(ev.message);
+                    self.midi_event_cursor += 1;
+                    processed += 1;
+                }
+                if self.midi_event_cursor < midi_sched.events.len()
+                    && midi_sched.events[self.midi_event_cursor].sample_frame < block_end
+                {
+                    self.telemetry
+                        .deferred_midi_event_blocks
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -961,7 +1147,7 @@ impl AudioEngine {
 
                 if let Some(ref mut mixer) = self.mixer {
                     mixer.clear_buffers(frames);
-                    if let Some(ref schedule) = schedule_opt {
+                    if let Some(schedule) = schedule_opt {
                         for clip in &schedule.clips {
                             if let Some(ch_buf) = mixer.channel_input_mut(clip.track_id, frames) {
                                 mix_clip_stereo(clip, ch_buf, frames, self.playhead_frame);
@@ -978,7 +1164,7 @@ impl AudioEngine {
                     }
                     mixer.process(frames, ch, output);
                 } else {
-                    if let Some(ref schedule) = schedule_opt {
+                    if let Some(schedule) = schedule_opt {
                         for clip in &schedule.clips {
                             mix_clip(clip, output, frames, ch, self.playhead_frame);
                         }
@@ -992,12 +1178,16 @@ impl AudioEngine {
                 self.generator.render_interleaved(output, ch);
             }
 
+            drop(schedule_guard);
+            drop(midi_schedule_guard);
+
             // ── advance playhead ───────────────────────────────────────────
             let new_head = if self.loop_enabled
                 && self.loop_end > self.loop_start
                 && self.playhead_frame + frames as u64 >= self.loop_end
             {
                 self.flush_midi_notes();
+                self.midi_cursor_needs_rebuild = true;
                 // Wrap around to loop start.
                 self.loop_start
                     + (self.playhead_frame + frames as u64 - self.loop_end)
@@ -1027,8 +1217,8 @@ impl AudioEngine {
             let read = self
                 .monitor_ring
                 .pop_samples(&mut self.monitor_scratch[..max_drain]);
-            for i in 0..read {
-                output[i] += self.monitor_scratch[i];
+            for (destination, sample) in output.iter_mut().zip(&self.monitor_scratch).take(read) {
+                *destination += sample;
             }
         } else {
             // Drain stale monitor samples silently so buffer stays fresh.
@@ -1062,6 +1252,45 @@ impl AudioEngine {
                 self.telemetry
                     .underrun_count
                     .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn apply_pending_mixer(&mut self) {
+        if self.deferred_mixer.is_none() {
+            let incoming = self
+                .pending_mixer_ptr
+                .swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !incoming.is_null() {
+                // SAFETY: the UI publishes ownership of this Box through the
+                // atomic pointer and no longer accesses it after the swap.
+                self.deferred_mixer = Some(unsafe { Box::from_raw(incoming) });
+            }
+        }
+
+        let Some(new_mixer) = self.deferred_mixer.take() else {
+            return;
+        };
+        let Some(old_mixer) = self.mixer.take() else {
+            self.mixer = Some(new_mixer);
+            return;
+        };
+
+        let old_pointer = Box::into_raw(old_mixer);
+        match self.retired_mixer_ptr.compare_exchange(
+            std::ptr::null_mut(),
+            old_pointer,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => self.mixer = Some(new_mixer),
+            Err(_) => {
+                // Retirement is full. Keep both graphs owned by this engine
+                // and retry on a later block; neither graph is dropped here.
+                // SAFETY: compare_exchange failed, so the retirement slot did
+                // not take ownership of `old_pointer`.
+                self.mixer = Some(unsafe { Box::from_raw(old_pointer) });
+                self.deferred_mixer = Some(new_mixer);
             }
         }
     }
@@ -1240,6 +1469,27 @@ impl EngineControl {
     }
 }
 
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        // The CPAL stream must be stopped before its callback state is dropped.
+        // Reclaim any graph pointers that were queued but not consumed.
+        let pending = self
+            .pending_mixer_ptr
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !pending.is_null() {
+            // SAFETY: after the swap, this engine is the sole owner of the Box.
+            drop(unsafe { Box::from_raw(pending) });
+        }
+        let retired = self
+            .retired_mixer_ptr
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            // SAFETY: after the swap, this engine is the sole owner of the Box.
+            drop(unsafe { Box::from_raw(retired) });
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1346,7 +1596,7 @@ mod tests {
             EngineCommand::EnableLoop(true),
         ];
         for &cmd in &cmds {
-            ring.push(cmd);
+            ring.try_push(cmd).expect("ring has available capacity");
         }
         for &expected in &cmds {
             let got = ring.pop().expect("should have a command");
@@ -1358,11 +1608,169 @@ mod tests {
     #[test]
     fn test_ring_seek_round_trip() {
         let ring = CommandRing::<8>::new();
-        ring.push(EngineCommand::Seek { frame: 123_456_789 });
+        ring.try_push(EngineCommand::Seek { frame: 123_456_789 })
+            .expect("ring has available capacity");
         match ring.pop().unwrap() {
             EngineCommand::Seek { frame } => assert_eq!(frame, 123_456_789),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn command_ring_rejects_when_full_without_overwriting_oldest() {
+        let ring = CommandRing::<4>::new();
+        for i in 0..4 {
+            ring.try_push(EngineCommand::Seek { frame: i })
+                .expect("queue capacity is four");
+        }
+
+        assert_eq!(ring.try_push(EngineCommand::Stop), Err(QueueError::Full));
+        for i in 0..4 {
+            assert_eq!(ring.pop(), Some(EngineCommand::Seek { frame: i }));
+        }
+    }
+
+    #[test]
+    fn command_ring_keeps_concurrent_producer_commands_intact() {
+        const PRODUCERS: usize = 2;
+        const COMMANDS_PER_PRODUCER: usize = 100;
+        let ring = Arc::new(CommandRing::<256>::new());
+        let mut producers = Vec::new();
+
+        for producer in 0..PRODUCERS {
+            let ring = Arc::clone(&ring);
+            producers.push(std::thread::spawn(move || {
+                for index in 0..COMMANDS_PER_PRODUCER {
+                    let frame = (producer * COMMANDS_PER_PRODUCER + index) as u64;
+                    loop {
+                        match ring.try_push(EngineCommand::Seek { frame }) {
+                            Ok(()) => break,
+                            Err(QueueError::Full | QueueError::Contended) => {
+                                std::thread::yield_now();
+                            }
+                            Err(
+                                QueueError::ScheduleRetentionFull | QueueError::ScheduleTooLarge,
+                            ) => unreachable!(),
+                        }
+                    }
+                }
+            }));
+        }
+
+        let mut received = Vec::with_capacity(PRODUCERS * COMMANDS_PER_PRODUCER);
+        while received.len() < PRODUCERS * COMMANDS_PER_PRODUCER {
+            if let Some(EngineCommand::Seek { frame }) = ring.pop() {
+                received.push(frame);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        for producer in producers {
+            producer.join().expect("producer thread should complete");
+        }
+
+        received.sort_unstable();
+        assert_eq!(received, (0..200).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn engine_handle_reports_command_queue_saturation() {
+        let (_engine, handle) = AudioEngine::new(48_000.0, 2);
+        for _ in 0..64 {
+            handle
+                .try_send(EngineCommand::Stop)
+                .expect("queue should have room");
+        }
+        assert_eq!(handle.try_send(EngineCommand::Play), Err(QueueError::Full));
+    }
+
+    #[test]
+    fn callback_processes_only_its_command_budget_per_block() {
+        let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
+        for index in 0..=COMMAND_PROCESSING_BUDGET {
+            handle
+                .try_send(EngineCommand::SetFrequency(100.0 + index as f32))
+                .expect("queue should have room");
+        }
+
+        let mut block = [0.0f32; 64];
+        engine.process(&mut block, 0);
+        assert_eq!(
+            engine.generator.frequency,
+            100.0 + (COMMAND_PROCESSING_BUDGET - 1) as f32
+        );
+
+        engine.process(&mut block, 0);
+        assert_eq!(
+            engine.generator.frequency,
+            100.0 + COMMAND_PROCESSING_BUDGET as f32
+        );
+    }
+
+    #[test]
+    fn callback_defers_excess_scheduled_midi_events_to_the_next_block() {
+        let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
+        let event = esperia_midi::ScheduledMidiEvent {
+            sample_frame: 0,
+            track_id: 0,
+            message: MidiMessage::ControlChange {
+                channel: 0,
+                controller: 1,
+                value: 0,
+            },
+        };
+        let schedule = MidiSchedule {
+            events: vec![event; SCHEDULED_MIDI_EVENT_BUDGET + 1],
+        };
+        handle
+            .set_midi_schedule(Arc::new(schedule))
+            .expect("schedule publication should be available");
+        handle.play();
+
+        let mut block = [0.0f32; 64];
+        engine.process(&mut block, 0);
+        assert_eq!(
+            engine
+                .telemetry
+                .deferred_midi_event_blocks
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        engine.process(&mut block, 0);
+        assert_eq!(
+            engine
+                .telemetry
+                .deferred_midi_event_blocks
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn schedule_storage_defers_reclamation_until_reader_finishes() {
+        let storage = ScheduleStorage::<ClipSchedule>::new();
+        let original = Arc::new(ClipSchedule { clips: Vec::new() });
+        let original_ptr = Arc::as_ptr(&original);
+        storage
+            .publish(Arc::clone(&original))
+            .expect("first schedule should publish");
+
+        let reader = storage.read();
+        for _ in 1..MAX_RETAINED_SCHEDULES {
+            storage
+                .publish(Arc::new(ClipSchedule { clips: Vec::new() }))
+                .expect("retirement storage should have capacity");
+        }
+        assert_eq!(reader.get().map(std::ptr::from_ref), Some(original_ptr));
+        assert_eq!(
+            storage.publish(Arc::new(ClipSchedule { clips: Vec::new() })),
+            Err(QueueError::ScheduleRetentionFull)
+        );
+
+        drop(reader);
+        storage.reclaim();
+        assert_eq!(storage.retained.lock().unwrap().len(), 1);
     }
 
     // ── AudioEngine ──────────────────────────────────────────────────────────
@@ -1443,10 +1851,12 @@ mod tests {
     #[test]
     fn test_engine_reconfigure_44100_mono() {
         let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-        handle.send(EngineCommand::Reconfigure {
-            sample_rate: 44_100.0,
-            channels: 1,
-        });
+        handle
+            .send(EngineCommand::Reconfigure {
+                sample_rate: 44_100.0,
+                channels: 1,
+            })
+            .expect("command should be accepted");
         handle.play();
         let mut buf = vec![0.0f32; 256];
         engine.process(&mut buf, 0);
@@ -1460,10 +1870,12 @@ mod tests {
     #[test]
     fn test_engine_reconfigure_96000_stereo() {
         let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-        handle.send(EngineCommand::Reconfigure {
-            sample_rate: 96_000.0,
-            channels: 2,
-        });
+        handle
+            .send(EngineCommand::Reconfigure {
+                sample_rate: 96_000.0,
+                channels: 2,
+            })
+            .expect("command should be accepted");
         handle.play();
         let mut buf = [0.0f32; 512];
         engine.process(&mut buf, 0);
@@ -1539,7 +1951,9 @@ mod tests {
         let schedule = Arc::new(ClipSchedule { clips: vec![clip] });
 
         let (mut engine, handle) = AudioEngine::new(48_000.0, 1);
-        handle.set_clip_schedule(schedule);
+        handle
+            .set_clip_schedule(schedule)
+            .expect("schedule publication should be available");
         handle.play();
 
         let mut buf = [0.0f32; 128];
@@ -1568,7 +1982,9 @@ mod tests {
         let schedule = Arc::new(ClipSchedule { clips: vec![clip] });
 
         let (mut engine, handle) = AudioEngine::new(48_000.0, 1);
-        handle.set_clip_schedule(schedule);
+        handle
+            .set_clip_schedule(schedule)
+            .expect("schedule publication should be available");
         handle.play();
 
         let mut buf = [0.0f32; 128];
@@ -1628,7 +2044,9 @@ mod tests {
         track.clips.push(clip);
 
         let sched = MidiSchedule::from_tracks(&[track], &TempoMap::constant(120.0), 48_000);
-        handle.set_midi_schedule(Arc::new(sched));
+        handle
+            .set_midi_schedule(Arc::new(sched))
+            .expect("schedule publication should be available");
         handle.play();
 
         let mut buf = [0.0f32; 1024]; // 512 stereo frames

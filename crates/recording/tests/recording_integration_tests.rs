@@ -124,7 +124,9 @@ fn record_save_reopen_and_playback_roundtrip() {
     });
 
     let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-    handle.set_clip_schedule(schedule);
+    handle
+        .set_clip_schedule(schedule)
+        .expect("schedule publication should be available");
     handle.seek(loaded_clip.timeline_start_frame);
     handle.play();
 

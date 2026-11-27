@@ -33,6 +33,12 @@ pub enum RoutingError {
         requested_frames: usize,
         max_frames: usize,
     },
+    /// A project graph exceeded a fixed upper bound for callback work/storage.
+    ResourceLimit {
+        resource: &'static str,
+        actual: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RoutingError {
@@ -48,6 +54,11 @@ impl std::fmt::Display for RoutingError {
                 f,
                 "audio buffer ({requested_frames} frames) exceeds mixer capacity ({max_frames})"
             ),
+            Self::ResourceLimit {
+                resource,
+                actual,
+                max,
+            } => write!(f, "mixer {resource} limit exceeded ({actual} > {max})"),
         }
     }
 }

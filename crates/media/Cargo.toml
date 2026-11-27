@@ -1,7 +1,9 @@
 [package]
 name = "esperia-media"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 # Audio decoding — WAV (pcm codec required), FLAC, MP3 etc. can be enabled later.
@@ -13,3 +15,6 @@ crossbeam-channel = "0.5"
 tempfile = "3"
 hound = "3.5"
 esperia-audio-engine = { path = "../audio-engine" }
+
+[lints]
+workspace = true
