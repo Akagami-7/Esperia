@@ -228,6 +228,26 @@ fn self_route_rejected() {
     assert!(result.is_err(), "self-route must be rejected");
 }
 
+#[test]
+fn rejects_mixer_graphs_above_fixed_callback_work_limits() {
+    let too_many_channels = vec![channel_cfg(1); esperia_mixer::MAX_CHANNELS + 1];
+    assert!(matches!(
+        MixerGraph::new(&too_many_channels, &[], 0.0, 256),
+        Err(esperia_mixer::routing::RoutingError::ResourceLimit {
+            resource: "channel",
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        MixerGraph::new(&[], &[], 0.0, esperia_mixer::MAX_BUFFER_FRAMES + 1),
+        Err(esperia_mixer::routing::RoutingError::ResourceLimit {
+            resource: "buffer frame",
+            ..
+        })
+    ));
+}
+
 /// `render_offline` is deterministic: identical inputs produce identical outputs.
 #[test]
 fn offline_render_is_deterministic() {

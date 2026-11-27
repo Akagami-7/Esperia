@@ -75,7 +75,9 @@ fn multitrack_simultaneous_clips_decoded_and_mixed() {
     });
 
     let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-    handle.set_clip_schedule(schedule);
+    handle
+        .set_clip_schedule(schedule)
+        .expect("schedule publication should be available");
     handle.play();
 
     let mut out = vec![0.0f32; 256 * 2];
@@ -121,7 +123,9 @@ fn different_sample_rates_resampled_and_played_across_buffer_sizes() {
         });
 
         let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-        handle.set_clip_schedule(schedule);
+        handle
+            .set_clip_schedule(schedule)
+            .expect("schedule publication should be available");
         handle.play();
 
         let mut out = vec![0.0f32; buf_frames * 2];
@@ -153,7 +157,9 @@ fn rapid_seek_play_pause_stop_and_loop_stability() {
     });
 
     let (mut engine, handle) = AudioEngine::new(48_000.0, 2);
-    handle.set_clip_schedule(schedule);
+    handle
+        .set_clip_schedule(schedule)
+        .expect("schedule publication should be available");
     handle.set_loop_region(1000, 2000);
     handle.enable_loop(true);
 

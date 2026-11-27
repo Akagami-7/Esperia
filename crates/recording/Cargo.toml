@@ -1,7 +1,9 @@
 [package]
 name = "esperia-recording"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 esperia-media = { path = "../media" }
@@ -10,3 +12,6 @@ esperia-project-model = { path = "../project-model" }
 [dev-dependencies]
 tempfile = "3"
 esperia-audio-engine = { path = "../audio-engine" }
+
+[lints]
+workspace = true

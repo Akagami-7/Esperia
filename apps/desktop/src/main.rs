@@ -178,6 +178,8 @@ struct EsperiaApp {
     frequency: f32,
     amplitude: f32,
     status_message: String,
+    last_command_queue_rejections: u64,
+    last_schedule_update_rejections: u64,
     show_device_panel: bool,
 
     // ── Timeline state ───────────────────────────────────────────────────
@@ -448,6 +450,8 @@ impl EsperiaApp {
             frequency: 440.0,
             amplitude: 0.1,
             status_message: status,
+            last_command_queue_rejections: 0,
+            last_schedule_update_rejections: 0,
             show_device_panel: false,
             mixer_meters: None,
             show_mixer_panel: false,
@@ -722,7 +726,9 @@ impl EsperiaApp {
         }
 
         let schedule = Arc::new(ClipSchedule { clips });
-        self.engine_handle.set_clip_schedule(schedule);
+        if let Err(error) = self.engine_handle.set_clip_schedule(schedule) {
+            self.status_message = format!("Clip schedule update rejected: {error}");
+        }
     }
 
     // ── Mixer graph rebuild ────────────────────────────────────────────────────
@@ -789,7 +795,9 @@ impl EsperiaApp {
             &project.tempo_map,
             self.active_sample_rate,
         );
-        self.engine_handle.set_midi_schedule(Arc::new(sched));
+        if let Err(error) = self.engine_handle.set_midi_schedule(Arc::new(sched)) {
+            self.status_message = format!("MIDI schedule update rejected: {error}");
+        }
     }
 
     fn connect_midi_port(&mut self, port_index: usize) {
@@ -1117,6 +1125,28 @@ impl EsperiaApp {
 
 impl eframe::App for EsperiaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.engine_handle.reclaim_schedules();
+        let rejected = self
+            .engine_handle
+            .telemetry
+            .command_queue_rejections
+            .load(Ordering::Acquire);
+        if rejected > self.last_command_queue_rejections {
+            self.last_command_queue_rejections = rejected;
+            self.status_message =
+                format!("Audio command queue is busy; {rejected} command(s) rejected");
+        }
+        let rejected = self
+            .engine_handle
+            .telemetry
+            .schedule_update_rejections
+            .load(Ordering::Acquire);
+        if rejected > self.last_schedule_update_rejections {
+            self.last_schedule_update_rejections = rejected;
+            self.status_message =
+                format!("Audio schedule update busy; {rejected} update(s) rejected");
+        }
+
         let ctx = ui.ctx().clone();
         ctx.request_repaint();
 

@@ -15,12 +15,12 @@ A monolithic single-crate architecture encourages tight coupling between the use
 3. **Cargo Workspace:** A single Git repository with a root `Cargo.toml` orchestrating independent member crates with shared dependency caching and unified testing.
 
 ## Chosen Decision
-We adopt a **virtual Cargo workspace** (`resolver = "3"`, edition 2024) with `apps/desktop`, `crates/audio-io`, and `crates/audio-engine` as initial members.
+We adopt a virtual Cargo workspace with resolver 3, Rust 2024, and shared minimum Rust version, license, and lint policy. The workspace contains `apps/desktop` and seven domain crates: `audio-io`, `audio-engine`, `project-model`, `media`, `recording`, `mixer`, and `midi`.
 
 ## Consequences
-- **Positive:** Strict compiler-enforced dependency separation (e.g. `crates/audio-io` cannot accidentally import `apps/desktop`), fast incremental builds, shared `Cargo.lock`, and single-command workspace testing (`cargo test --workspace`).
+- **Positive:** Compiler-enforced dependency separation, fast incremental builds, shared dependency resolution, and single-command workspace verification (`cargo test --workspace`).
 - **Negative:** Minor configuration boilerplate in crate `Cargo.toml` files.
 
 ## Future Reconsideration Conditions
-None. Additional crates (`project-model`, `dsp`, `commands`, `media`) will be added to this workspace as their responsibilities solidify.
+Add a crate only when it has a stable, independent responsibility and a real dependency boundary.
 

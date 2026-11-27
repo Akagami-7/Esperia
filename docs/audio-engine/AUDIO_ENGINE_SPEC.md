@@ -116,7 +116,7 @@ At the conclusion of each block render:
 3. **Decibel Conversion:**
    $$\text{dBFS} = 20 \log_{10}(\text{Peak})$$
 4. **Lock-Free Dispatch:**
-   The calculated peak and RMS values, alongside the current playhead frame, are placed into an SPSC ring buffer for the UI thread. If the buffer is full, the audio thread overwrites the unread entry (lossy telemetry is permissible; stalling is not).
+   Current single-value telemetry (peak, underrun count, callback duration, transport state, and playhead) is published through atomic latest-value fields. No meter SPSC queue is currently implemented. If a future queue is added, the audio producer discards the newest item when full; it never advances the consumer's read cursor or overwrites unread entries.
 
 ---
 

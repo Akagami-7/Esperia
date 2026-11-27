@@ -75,8 +75,8 @@ impl Bus {
     #[inline]
     pub fn accumulate_scaled(&mut self, src: &[f32], frames: usize, scale: f32) {
         let len = (frames * 2).min(self.buffer.len()).min(src.len());
-        for i in 0..len {
-            self.buffer[i] += src[i] * scale;
+        for (destination, source) in self.buffer.iter_mut().zip(src).take(len) {
+            *destination += source * scale;
         }
     }
 

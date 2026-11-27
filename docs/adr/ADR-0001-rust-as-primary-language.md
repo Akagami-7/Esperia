@@ -15,7 +15,7 @@ Traditional DAWs written in C++ suffer from persistent memory corruption bugs, d
 3. **Zig:** Modern manual memory management and C interoperability, but smaller ecosystem and lacks mature audio/GUI production libraries.
 
 ## Chosen Decision
-We choose **Rust (2024 edition)** as the primary programming language for Esperia across all modules (engine, I/O, UI, and tooling).
+We choose stable Rust 2024 as the primary language and set Rust 1.95.0 as the minimum supported compiler. Workspace manifests share this metadata through `[workspace.package]`; CI uses the same compiler release.
 
 ## Consequences
 - **Positive:** Fearless concurrency (`Send`/`Sync`), compile-time prevention of data races, zero-cost abstractions, robust package management with Cargo, and memory safety without GC pauses.

@@ -26,6 +26,12 @@ pub use routing::{RouteTarget, RoutingError, SendRoute, topological_bus_order};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Maximum graph dimensions accepted by the real-time mixer.
+pub const MAX_CHANNELS: usize = 4096;
+pub const MAX_BUSES: usize = 512;
+pub const MAX_SENDS: usize = 8192;
+pub const MAX_BUFFER_FRAMES: usize = 16_384;
+
 /// Snapshot of all meters in the mixer graph, cloneable for UI readout.
 #[derive(Clone, Default)]
 pub struct MixerMeters {
@@ -59,6 +65,40 @@ impl MixerGraph {
         master_gain_db: f32,
         max_frames: usize,
     ) -> Result<Self, RoutingError> {
+        if channel_configs.len() > MAX_CHANNELS {
+            return Err(RoutingError::ResourceLimit {
+                resource: "channel",
+                actual: channel_configs.len(),
+                max: MAX_CHANNELS,
+            });
+        }
+        if bus_configs.len() > MAX_BUSES {
+            return Err(RoutingError::ResourceLimit {
+                resource: "bus",
+                actual: bus_configs.len(),
+                max: MAX_BUSES,
+            });
+        }
+        let send_count = channel_configs
+            .iter()
+            .map(|channel| channel.sends.len())
+            .chain(bus_configs.iter().map(|bus| bus.sends.len()))
+            .sum::<usize>();
+        if send_count > MAX_SENDS {
+            return Err(RoutingError::ResourceLimit {
+                resource: "send",
+                actual: send_count,
+                max: MAX_SENDS,
+            });
+        }
+        if max_frames > MAX_BUFFER_FRAMES {
+            return Err(RoutingError::ResourceLimit {
+                resource: "buffer frame",
+                actual: max_frames,
+                max: MAX_BUFFER_FRAMES,
+            });
+        }
+
         let cap = max_frames.max(64);
         let mut bus_ids = Vec::with_capacity(bus_configs.len());
         let mut bus_index = HashMap::with_capacity(bus_configs.len());

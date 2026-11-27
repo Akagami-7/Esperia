@@ -16,7 +16,7 @@ This roadmap documents our transition from empty repository to a full production
 ## Stage 2 — Technical Foundation (Current)
 - [x] Virtual Cargo workspace with resolver 3 and Rust 2024 edition.
 - [x] Crate separation: `apps/desktop`, `crates/audio-io`, `crates/audio-engine`.
-- [x] Workspace dependencies: `eframe`, `vizia`, `cpal`, `tracing`, `tracing-subscriber`.
+- [x] Workspace dependencies: `eframe`, `egui`, `cpal`, `tracing`, `tracing-subscriber`.
 - [x] Engineering guidelines (`AGENTS.md`) and CI pipeline configuration.
 - [x] Clean zero-warning verification across `cargo check`, `cargo fmt`, `cargo clippy`, and `cargo test`.
 
