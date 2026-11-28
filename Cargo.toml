@@ -8,6 +8,7 @@ members = [
     "crates/recording",
     "crates/mixer",
     "crates/midi",
+    "crates/ui-kit",
 ]
 default-members = [
     "apps/desktop",

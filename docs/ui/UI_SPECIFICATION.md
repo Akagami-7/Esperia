@@ -8,24 +8,26 @@
 
 ## 1. Design System & Aesthetics
 
-Esperia adheres to a **hardware-inspired, high-contrast dark studio aesthetic**. The interface is engineered for prolonged sessions in low-light studio environments, prioritizing legibility, clear spatial hierarchy, and zero visual clutter.
+Esperia adheres to a **graphite studio aesthetic with tactile depth and selective violet accents**. The interface is engineered for prolonged sessions in low-light studio environments, prioritizing legibility, clear spatial hierarchy, and zero visual clutter. The `esperia-ui` crate is the source of truth for visual tokens; this specification records intent, while the Component Lab is where starting values are tuned.
 
 ### 1.1 Color Palette
-- **Background Deep (`#121316`):** Root window background and canvas void.
-- **Surface Level 1 (`#1a1c23`):** Panels, track headers, sidebar backgrounds.
-- **Surface Level 2 (`#242731`):** Active panels, timeline lanes, mixer channels.
-- **Border / Divider (`#2e323e`):** 1px subtle panel boundaries.
-- **Accent Primary (`#4a88ff`):** Transport play state, selection highlights, active indicators.
-- **Accent Record (`#ff3b30`):** Arming state, record button, active recording clips.
-- **Accent Solo (`#ffcc00`):** Solo button active state.
-- **Accent Mute (`#ff5e3a`):** Mute button active state.
-- **Text Primary (`#f0f2f5`):** High-contrast labels, readouts, track names.
-- **Text Secondary (`#8e95a5`):** Secondary values, timecode units, inactive controls.
+- **Canvas (`#11141a`):** Root window background and canvas void.
+- **Shell (`#151a22`):** Application chrome and side navigation.
+- **Panel (`#1a2029`):** Panels, track headers, sidebar backgrounds.
+- **Raised Panel (`#222a35`):** Active/elevated panels and timeline lanes.
+- **Border (`#343d49`):** Subtle panel boundaries.
+- **Accent Violet (`#ac70ff`):** Esperia identity, focus, selection and active controls.
+- **Success (`#4acc84`):** Playback and positive operational states.
+- **Danger (`#ef525b`):** Recording, clipping and destructive actions.
+- **Warning (`#ecb14d`):** Warnings and solo-related status.
+- **Cyan (`#4bc3da`):** Secondary editing and selection states.
+- **Text Primary (`#edeff4`):** High-contrast labels, readouts, track names.
+- **Text Secondary (`#a6aebc`):** Secondary values, timecode units, inactive controls.
 
 ### 1.2 Typography & Spacing
-- **Interface Font:** Inter / System UI Sans (clean grotesque sans-serif).
-- **Monospace Font:** JetBrains Mono / SF Mono (timecode, sample counters, BPM readouts, dBFS meters).
-- **Grid Unit:** 4px base increment (standard paddings: 4px, 8px, 12px, 16px).
+- **Interface font (target):** Inter. The running app uses egui's bundled proportional family until Inter is vendored, so macOS, Windows, and Linux match.
+- **Numeric font (target):** IBM Plex Mono for BPM, timecode, and meters. The running app uses egui's bundled monospace family until that file is vendored.
+- **Grid unit:** 4-point spacing (`4`, `8`, `12`, `16`, `24`, `32`). Sizes are egui logical points and follow display density.
 
 ---
 
