@@ -8,7 +8,7 @@ pub(super) fn show(
     ui: &mut egui::Ui,
     theme: &Theme,
     selected: &mut Section,
-    content: impl FnOnce(&mut egui::Ui, &Theme, Section),
+    content: impl FnOnce(&mut egui::Ui, &Theme),
 ) {
     let p = &theme.palette;
     egui::Panel::top("component_lab_header")
@@ -59,8 +59,22 @@ pub(super) fn show(
             );
             ui.add_space(theme.metrics.spacing.sm);
             for (section, title, detail) in [
-                (Section::Buttons, "Buttons", "Primary · Secondary · Icon"),
-                (Section::Toggles, "Toggles", "Enabled · Disabled"),
+                (
+                    Section::Buttons,
+                    "Buttons",
+                    "Primary · Secondary · Pill · Transport",
+                ),
+                (
+                    Section::Toggles,
+                    "Toggles & Segmented",
+                    "Switch · Segmented · Latch",
+                ),
+                (
+                    Section::KnobsAndFaders,
+                    "Knobs & Faders",
+                    "Rotary · Bipolar · dB Fader",
+                ),
+                (Section::Meters, "Meters", "Peak Hold · RMS · Clipping"),
                 (Section::Surfaces, "Surfaces", "Elevation · borders · focus"),
             ] {
                 let response = ui.selectable_label(*selected == section, title);
@@ -87,6 +101,6 @@ pub(super) fn show(
                 .inner_margin(egui::Margin::same(24)),
         )
         .show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| content(ui, theme, *selected));
+            egui::ScrollArea::vertical().show(ui, |ui| content(ui, theme));
         });
 }

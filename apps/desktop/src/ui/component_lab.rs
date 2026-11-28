@@ -1,7 +1,12 @@
 use eframe::egui;
 use esperia_ui::{
     Theme,
-    primitives::{Icon, IconKind, Shadow, Surface, SurfaceKind, SurfaceStyle},
+    components::{
+        IconButton, KnobMode, MeterState, PeakMeter, PillButton, PrimaryButton, RmsMeter,
+        RotaryKnob, SecondaryButton, SegmentedButton, Toggle, ToggleButton, TransportButton,
+        TransportVariant, VolumeFader,
+    },
+    primitives::{Icon, IconKind, Surface, SurfaceKind, SurfaceStyle},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9,12 +14,57 @@ pub(super) enum Section {
     #[default]
     Buttons,
     Toggles,
+    KnobsAndFaders,
+    Meters,
     Surfaces,
 }
 
 pub struct ComponentLabApp {
     theme: Theme,
     section: Section,
+    state: LabState,
+}
+
+struct LabState {
+    count_in: bool,
+    metronome: bool,
+    playing: bool,
+    recording: bool,
+    loop_on: bool,
+    snap_on: bool,
+    auto_quantize: bool,
+    segmented_mode: usize,
+    gain_knob: f32,
+    pan_knob: f32,
+    stepped_knob: f32,
+    mini_knob: f32,
+    fader_db: f32,
+    horiz_db: f32,
+    meter_drive: f32,
+    peak_state: MeterState,
+}
+
+impl Default for LabState {
+    fn default() -> Self {
+        Self {
+            count_in: false,
+            metronome: true,
+            playing: false,
+            recording: false,
+            loop_on: true,
+            snap_on: true,
+            auto_quantize: false,
+            segmented_mode: 0,
+            gain_knob: 0.72,
+            pan_knob: 0.0,
+            stepped_knob: 0.5,
+            mini_knob: 0.35,
+            fader_db: 0.0,
+            horiz_db: -6.0,
+            meter_drive: 0.68,
+            peak_state: MeterState::default(),
+        }
+    }
 }
 
 impl ComponentLabApp {
@@ -24,14 +74,18 @@ impl ComponentLabApp {
         Self {
             theme,
             section: Section::Buttons,
+            state: LabState::default(),
         }
     }
 }
 
 impl eframe::App for ComponentLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        super::shell::show(ui, &self.theme, &mut self.section, |ui, theme, section| {
-            lab_content::show(ui, theme, section);
+        self.state.peak_state.update(self.state.meter_drive, 0.02);
+        let section = self.section;
+        let lab_state = &mut self.state;
+        super::shell::show(ui, &self.theme, &mut self.section, |ui, theme| {
+            lab_content::show(ui, theme, section, lab_state);
         });
     }
 }
@@ -39,7 +93,7 @@ impl eframe::App for ComponentLabApp {
 mod lab_content {
     use super::*;
 
-    pub(super) fn show(ui: &mut egui::Ui, theme: &Theme, selected: Section) {
+    pub(super) fn show(ui: &mut egui::Ui, theme: &Theme, selected: Section, state: &mut LabState) {
         let p = &theme.palette;
         ui.label(
             egui::RichText::new("Component Lab")
@@ -49,14 +103,18 @@ mod lab_content {
         );
         ui.add_space(theme.metrics.spacing.xs);
         ui.label(
-            egui::RichText::new("A shared graphite surface system with selective violet accents.")
-                .size(theme.typography.label)
-                .color(p.text_secondary),
+            egui::RichText::new(
+                "Interactive Esperia UI Kit · graphite surfaces & selective violet accents.",
+            )
+            .size(theme.typography.label)
+            .color(p.text_secondary),
         );
         ui.add_space(theme.metrics.spacing.xl);
         match selected {
-            Section::Buttons => button_placeholders(ui, theme),
-            Section::Toggles => toggle_placeholders(ui, theme),
+            Section::Buttons => buttons_section(ui, theme, state),
+            Section::Toggles => toggles_section(ui, theme, state),
+            Section::KnobsAndFaders => knobs_and_faders_section(ui, theme, state),
+            Section::Meters => meters_section(ui, theme, state),
             Section::Surfaces => surface_samples(ui, theme),
         }
     }
@@ -78,46 +136,271 @@ mod lab_content {
         ui.add_space(theme.metrics.spacing.sm);
     }
 
-    fn button_placeholders(ui: &mut egui::Ui, theme: &Theme) {
+    fn buttons_section(ui: &mut egui::Ui, theme: &Theme, state: &mut LabState) {
         section_title(
             ui,
             theme,
-            "Button states",
-            "Visual placeholders — interaction comes in the next stage",
+            "Standard buttons",
+            "Primary, secondary, and disabled states",
         );
         ui.horizontal_wrapped(|ui| {
-            preview_card(ui, theme, "DEFAULT", Preview::Default);
-            preview_card(ui, theme, "HOVER", Preview::Hover);
-            preview_card(ui, theme, "PRESSED", Preview::Pressed);
-            preview_card(ui, theme, "SELECTED", Preview::Selected);
-            preview_card(ui, theme, "DISABLED", Preview::Disabled);
-            preview_card(ui, theme, "FOCUSED", Preview::Focused);
+            let _ = ui.add(PrimaryButton::new("Export Mix").theme(theme));
+            let _ = ui.add(SecondaryButton::new("Cancel").theme(theme));
+            let _ = ui.add(PrimaryButton::new("Disabled").theme(theme).enabled(false));
+            let _ = ui.add(SecondaryButton::new("Disabled").theme(theme).enabled(false));
         });
+
         ui.add_space(theme.metrics.spacing.xl);
         section_title(
             ui,
             theme,
-            "Surface levels",
-            "Matte workspace · satin controls · floating overlays",
+            "Transport & Count-in / Metronome Pill",
+            "Tactile squircle controls and two-slot latch pill",
         );
         ui.horizontal_wrapped(|ui| {
-            surface_card(ui, theme, "MATTE", SurfaceKind::Matte);
-            surface_card(ui, theme, "RAISED", SurfaceKind::Raised);
-            surface_card(ui, theme, "FLOATING", SurfaceKind::Floating);
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Play, col),
+                        TransportVariant::Play,
+                    )
+                    .theme(theme)
+                    .active(state.playing),
+                )
+                .clicked()
+            {
+                state.playing = !state.playing;
+            }
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Stop, col),
+                        TransportVariant::Stop,
+                    )
+                    .theme(theme),
+                )
+                .clicked()
+            {
+                state.playing = false;
+                state.recording = false;
+            }
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Record, col),
+                        TransportVariant::Record,
+                    )
+                    .theme(theme)
+                    .active(state.recording),
+                )
+                .clicked()
+            {
+                state.recording = !state.recording;
+            }
+
+            ui.add_space(theme.metrics.spacing.md);
+
+            let pill_resp = PillButton::new(
+                |ui, rect, col| {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "123",
+                        egui::FontId::proportional(11.0),
+                        col,
+                    );
+                },
+                |ui, rect, col| {
+                    let c = rect.center();
+                    let stroke = egui::Stroke::new(1.5, col);
+                    ui.painter().line_segment(
+                        [egui::pos2(c.x - 6.0, c.y + 7.0), egui::pos2(c.x, c.y - 7.0)],
+                        stroke,
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(c.x, c.y - 7.0), egui::pos2(c.x + 6.0, c.y + 7.0)],
+                        stroke,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(c.x - 4.0, c.y + 7.0),
+                            egui::pos2(c.x + 4.0, c.y + 7.0),
+                        ],
+                        stroke,
+                    );
+                },
+            )
+            .theme(theme)
+            .active_a(state.count_in)
+            .active_b(state.metronome)
+            .show(ui);
+
+            if pill_resp.clicked_a {
+                state.count_in = !state.count_in;
+            }
+            if pill_resp.clicked_b {
+                state.metronome = !state.metronome;
+            }
+
+            ui.add_space(theme.metrics.spacing.md);
+
+            if ui
+                .add(
+                    IconButton::new(|ui, rect, col| {
+                        Icon::paint(ui.painter(), rect, IconKind::ChevronRight, col);
+                    })
+                    .theme(theme)
+                    .active(state.loop_on)
+                    .tooltip("Inspector"),
+                )
+                .clicked()
+            {
+                state.loop_on = !state.loop_on;
+            }
         });
     }
 
-    fn toggle_placeholders(ui: &mut egui::Ui, theme: &Theme) {
+    fn toggles_section(ui: &mut egui::Ui, theme: &Theme, state: &mut LabState) {
         section_title(
             ui,
             theme,
-            "Toggle states",
-            "Static previews · no control behavior is implied",
+            "Switch toggles",
+            "Animated thumb travel with semantic accent",
         );
         ui.horizontal_wrapped(|ui| {
-            toggle_card(ui, theme, "SNAP · OFF", TogglePreview::Off);
-            toggle_card(ui, theme, "SNAP · ON", TogglePreview::On);
-            toggle_card(ui, theme, "SNAP · DISABLED", TogglePreview::Disabled);
+            ui.add(
+                Toggle::new(&mut state.snap_on)
+                    .label("Snap to Grid")
+                    .theme(theme),
+            );
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.add(
+                Toggle::new(&mut state.auto_quantize)
+                    .label("Auto Quantize")
+                    .theme(theme),
+            );
+            ui.add_space(theme.metrics.spacing.lg);
+            let mut disabled_val = false;
+            ui.add(
+                Toggle::new(&mut disabled_val)
+                    .label("Disabled")
+                    .theme(theme)
+                    .enabled(false),
+            );
+        });
+
+        ui.add_space(theme.metrics.spacing.xl);
+        section_title(
+            ui,
+            theme,
+            "Latch & Segmented controls",
+            "Mutually exclusive and toggle buttons",
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add(ToggleButton::new("Loop", state.loop_on).theme(theme))
+                .clicked()
+            {
+                state.loop_on = !state.loop_on;
+            }
+            ui.add_space(theme.metrics.spacing.md);
+            state.segmented_mode =
+                SegmentedButton::new(&["Notes", "Chords", "Scales"], state.segmented_mode)
+                    .theme(theme)
+                    .show(ui);
+        });
+    }
+
+    fn knobs_and_faders_section(ui: &mut egui::Ui, theme: &Theme, state: &mut LabState) {
+        section_title(
+            ui,
+            theme,
+            "Rotary knobs",
+            "Vertical drag (Shift for fine control), double-click to reset",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                RotaryKnob::new(&mut state.gain_knob)
+                    .label("Drive")
+                    .theme(theme),
+            );
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.add(
+                RotaryKnob::new(&mut state.pan_knob)
+                    .mode(KnobMode::Bipolar)
+                    .label("Pan")
+                    .theme(theme),
+            );
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.add(
+                RotaryKnob::new(&mut state.stepped_knob)
+                    .mode(KnobMode::Stepped(5))
+                    .label("Steps")
+                    .theme(theme),
+            );
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.add(
+                RotaryKnob::new(&mut state.mini_knob)
+                    .mini()
+                    .label("Send")
+                    .theme(theme),
+            );
+        });
+
+        ui.add_space(theme.metrics.spacing.xl);
+        section_title(
+            ui,
+            theme,
+            "Volume faders",
+            "Musical dB taper (-60 dB .. +6 dB, double-click for 0.0 dB)",
+        );
+        ui.horizontal(|ui| {
+            ui.add(VolumeFader::vertical(&mut state.fader_db).theme(theme));
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{:.1} dB", state.fader_db))
+                        .monospace()
+                        .color(theme.palette.text_primary),
+                );
+                ui.add_space(theme.metrics.spacing.md);
+                ui.add(VolumeFader::horizontal(&mut state.horiz_db).theme(theme));
+                ui.label(
+                    egui::RichText::new(format!("Aux: {:.1} dB", state.horiz_db))
+                        .monospace()
+                        .size(theme.typography.metadata)
+                        .color(theme.palette.text_secondary),
+                );
+            });
+        });
+    }
+
+    fn meters_section(ui: &mut egui::Ui, theme: &Theme, state: &mut LabState) {
+        section_title(
+            ui,
+            theme,
+            "Peak & RMS meters",
+            "Green/amber/red zones with peak-hold ballistics",
+        );
+        ui.horizontal(|ui| {
+            ui.add(PeakMeter::new(&state.peak_state).theme(theme));
+            ui.add(PeakMeter::new(&state.peak_state).theme(theme));
+            ui.add_space(theme.metrics.spacing.sm);
+            ui.add(RmsMeter::new(state.meter_drive * 0.78).theme(theme));
+            ui.add_space(theme.metrics.spacing.lg);
+            ui.vertical(|ui| {
+                ui.label("Input Drive");
+                ui.add(egui::Slider::new(&mut state.meter_drive, 0.0..=1.0));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Peak hold: {:.0}%",
+                        state.peak_state.peak_hold * 100.0
+                    ))
+                    .monospace()
+                    .size(theme.typography.metadata)
+                    .color(theme.palette.text_secondary),
+                );
+            });
         });
     }
 
@@ -155,150 +438,6 @@ mod lab_content {
                 ui.label(egui::RichText::new(name).color(theme.palette.text_secondary));
             });
         }
-    }
-
-    #[derive(Clone, Copy)]
-    enum Preview {
-        Default,
-        Hover,
-        Pressed,
-        Selected,
-        Disabled,
-        Focused,
-    }
-
-    fn preview_card(ui: &mut egui::Ui, theme: &Theme, label: &str, state: Preview) {
-        let (outer, _) = ui.allocate_exact_size(egui::vec2(154.0, 104.0), egui::Sense::hover());
-        Surface::paint(
-            ui.painter(),
-            outer,
-            SurfaceStyle::from_theme(theme, SurfaceKind::Matte),
-        );
-        ui.painter().text(
-            egui::pos2(outer.left() + 12.0, outer.top() + 13.0),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(9.0),
-            theme.palette.text_muted,
-        );
-
-        let p = &theme.palette;
-        let button = egui::Rect::from_min_size(
-            egui::pos2(outer.left() + 12.0, outer.top() + 36.0),
-            egui::vec2(130.0, 34.0),
-        );
-        let (fill, border, text) = match state {
-            Preview::Default => (p.control, p.border, p.text_primary),
-            Preview::Hover => (p.control_hover, p.border_strong, p.text_primary),
-            Preview::Pressed => (p.control_pressed, p.accent, p.text_primary),
-            Preview::Selected => (p.accent_active, p.accent_hover, p.text_primary),
-            Preview::Disabled => (p.panel_raised, p.border, p.text_muted),
-            Preview::Focused => (p.control, p.border_strong, p.text_primary),
-        };
-
-        // Buttons are composed from the shared raised surface so highlight,
-        // border and shadow stay identical to every other control.
-        let interactive = !matches!(state, Preview::Pressed | Preview::Disabled);
-        Surface::paint(
-            ui.painter(),
-            button,
-            SurfaceStyle {
-                fill,
-                radius: theme.metrics.radii.button,
-                border,
-                highlight: interactive.then_some(egui::Color32::from_white_alpha(18)),
-                inner_shade: (!matches!(state, Preview::Disabled))
-                    .then_some(egui::Color32::from_black_alpha(30)),
-                shadow: interactive.then(|| Shadow::control(theme)),
-            },
-        );
-        if matches!(state, Preview::Pressed) {
-            // Recessed top edge reads as a pushed control, not a latched one.
-            ui.painter().line_segment(
-                [
-                    egui::pos2(button.left() + 6.0, button.top() + 1.5),
-                    egui::pos2(button.right() - 6.0, button.top() + 1.5),
-                ],
-                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70)),
-            );
-        }
-        if matches!(state, Preview::Focused) {
-            esperia_ui::primitives::FocusRing::paint(ui.painter(), button, theme, true);
-        }
-
-        if !matches!(state, Preview::Disabled) {
-            Icon::paint(
-                ui.painter(),
-                egui::Rect::from_center_size(
-                    egui::pos2(button.left() + 18.0, button.center().y),
-                    egui::vec2(15.0, 15.0),
-                ),
-                IconKind::Play,
-                text,
-            );
-        }
-        ui.painter().text(
-            button.center(),
-            egui::Align2::CENTER_CENTER,
-            "Play",
-            egui::FontId::proportional(theme.typography.control_label),
-            text,
-        );
-    }
-
-    #[derive(Clone, Copy)]
-    enum TogglePreview {
-        Off,
-        On,
-        Disabled,
-    }
-
-    fn toggle_card(ui: &mut egui::Ui, theme: &Theme, label: &str, state: TogglePreview) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(188.0, 80.0), egui::Sense::hover());
-        Surface::paint(
-            ui.painter(),
-            rect,
-            SurfaceStyle::from_theme(theme, SurfaceKind::Matte),
-        );
-        ui.painter().text(
-            egui::pos2(rect.left() + 12.0, rect.top() + 16.0),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(9.0),
-            theme.palette.text_muted,
-        );
-
-        let (track_fill, knob_fill, knob_on) = match state {
-            TogglePreview::Off => (theme.palette.control, theme.palette.text_secondary, false),
-            TogglePreview::On => (
-                theme.palette.accent_active,
-                theme.palette.accent_hover,
-                true,
-            ),
-            TogglePreview::Disabled => {
-                (theme.palette.panel_raised, theme.palette.text_muted, false)
-            }
-        };
-        let track = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 12.0, rect.top() + 34.0),
-            egui::vec2(48.0, 26.0),
-        );
-        let radius = egui::CornerRadius::same(13);
-        ui.painter().rect_filled(track, radius, track_fill);
-        ui.painter().rect_stroke(
-            track,
-            radius,
-            egui::Stroke::new(1.0, theme.palette.border),
-            egui::StrokeKind::Inside,
-        );
-        // Position, not colour alone, communicates on/off.
-        let knob_x = if knob_on {
-            track.right() - 13.0
-        } else {
-            track.left() + 13.0
-        };
-        ui.painter()
-            .circle_filled(egui::pos2(knob_x, track.center().y), 9.0, knob_fill);
     }
 
     fn surface_card(ui: &mut egui::Ui, theme: &Theme, label: &str, kind: SurfaceKind) {
