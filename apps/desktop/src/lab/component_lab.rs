@@ -4,7 +4,7 @@ use esperia_ui::{
     components::{
         IconButton, KnobMode, MeterState, PeakMeter, PillButton, PrimaryButton, RmsMeter,
         RotaryKnob, SecondaryButton, SegmentedButton, Toggle, ToggleButton, TransportButton,
-        TransportVariant, VolumeFader,
+        TransportVariant, VolumeFader, VolumeGlider,
     },
     primitives::{Icon, IconKind, Surface, SurfaceKind, SurfaceStyle},
 };
@@ -40,6 +40,7 @@ struct LabState {
     mini_knob: f32,
     fader_db: f32,
     horiz_db: f32,
+    glider: VolumeGlider,
     meter_drive: f32,
     peak_state: MeterState,
 }
@@ -61,6 +62,7 @@ impl Default for LabState {
             mini_knob: 0.35,
             fader_db: 0.0,
             horiz_db: -6.0,
+            glider: VolumeGlider::new(),
             meter_drive: 0.68,
             peak_state: MeterState::default(),
         }
@@ -367,6 +369,19 @@ mod lab_content {
                 ui.add(VolumeFader::horizontal(&mut state.horiz_db).theme(theme));
                 ui.label(
                     egui::RichText::new(format!("Aux: {:.1} dB", state.horiz_db))
+                        .monospace()
+                        .size(theme.typography.metadata)
+                        .color(theme.palette.text_secondary),
+                );
+                ui.add_space(theme.metrics.spacing.lg);
+                ui.label(
+                    egui::RichText::new("Spring Volume Glider")
+                        .size(theme.typography.control_label)
+                        .color(theme.palette.text_primary),
+                );
+                state.glider.show(ui);
+                ui.label(
+                    egui::RichText::new(format!("Glider: {:.0}%", state.glider.value() * 100.0))
                         .monospace()
                         .size(theme.typography.metadata)
                         .color(theme.palette.text_secondary),

@@ -1,5 +1,6 @@
-//! Shared visual language and reusable egui drawing primitives for Esperia.
+//! Shared visual language, animations, primitives, and reusable egui components for Esperia.
 
+pub mod animation;
 pub mod components;
 pub mod primitives;
 pub mod theme;

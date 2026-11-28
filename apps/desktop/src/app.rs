@@ -12,12 +12,8 @@
 //! wires them together as the top-level coordinator.
 
 #[cfg(target_os = "macos")]
-#[path = "macos_menu.rs"]
-mod macos_menu;
-#[path = "piano_roll.rs"]
-mod piano_roll;
-#[path = "volume_glider.rs"]
-mod volume_glider;
+use crate::platform::macos_menu;
+use crate::views::piano_roll;
 
 use eframe::egui;
 use esperia_audio_engine::{AudioEngine, ClipSchedule, EngineHandle, MonitorRing, ScheduledClip};
@@ -39,11 +35,11 @@ use esperia_project_model::{
 use esperia_recording::{
     InputChannelSelection, LatencyConfig, PunchRegion, Recorder, RecordingStatus,
 };
+use esperia_ui::components::VolumeGlider;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use volume_glider::VolumeGlider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Timeline constants

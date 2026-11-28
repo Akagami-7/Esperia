@@ -1,9 +1,12 @@
 #[cfg(not(feature = "component-lab"))]
 mod app;
+#[cfg(not(feature = "component-lab"))]
+mod platform;
+#[cfg(not(feature = "component-lab"))]
+mod views;
 
 #[cfg(feature = "component-lab")]
-#[path = "ui/mod.rs"]
-mod ui;
+mod lab;
 
 #[cfg(not(feature = "component-lab"))]
 fn main() -> eframe::Result<()> {
@@ -21,6 +24,6 @@ fn main() -> eframe::Result<()> {
                 .with_title("Esperia — UI Laboratory"),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(ui::component_lab::ComponentLabApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(lab::component_lab::ComponentLabApp::new(cc)))),
     )
 }
