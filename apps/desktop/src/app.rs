@@ -35,7 +35,11 @@ use esperia_project_model::{
 use esperia_recording::{
     InputChannelSelection, LatencyConfig, PunchRegion, Recorder, RecordingStatus,
 };
-use esperia_ui::components::VolumeGlider;
+use esperia_ui::{
+    Theme,
+    components::{ToggleButton, TransportButton, TransportVariant, VolumeGlider},
+    primitives::{Icon, IconKind},
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +119,8 @@ impl ThumbnailCache {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct EsperiaApp {
+    theme: Theme,
+
     #[cfg(target_os = "macos")]
     native_menu: Option<macos_menu::NativeMenu>,
 
@@ -321,7 +327,8 @@ fn recorder_mon_enabled(
 
 impl EsperiaApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        esperia_ui::Theme::default().apply(&cc.egui_ctx);
+        let theme = Theme::default();
+        theme.apply(&cc.egui_ctx);
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
@@ -415,6 +422,7 @@ impl EsperiaApp {
         };
 
         let mut app = Self {
+            theme,
             #[cfg(target_os = "macos")]
             native_menu,
             device_manager: mgr,
@@ -1358,55 +1366,118 @@ impl EsperiaApp {
 
         ui.horizontal(|ui| {
             // ── Left: Panel & Track creation shortcuts ────────────────────────
-            let pr_btn = egui::Button::new("🎹 Piano Roll").fill(if self.show_piano_roll {
-                egui::Color32::from_rgb(35, 115, 210)
-            } else {
-                egui::Color32::from_gray(58)
-            });
-            if ui.add(pr_btn).clicked() {
+            if ui
+                .add(ToggleButton::new("Piano Roll", self.show_piano_roll).theme(&self.theme))
+                .clicked()
+            {
                 self.show_piano_roll = !self.show_piano_roll;
             }
 
-            let mix_btn = egui::Button::new("🎚 Mixer").fill(if self.show_mixer_panel {
-                egui::Color32::from_rgb(35, 115, 210)
-            } else {
-                egui::Color32::from_gray(58)
-            });
-            if ui.add(mix_btn).clicked() {
+            if ui
+                .add(ToggleButton::new("Mixer", self.show_mixer_panel).theme(&self.theme))
+                .clicked()
+            {
                 self.show_mixer_panel = !self.show_mixer_panel;
                 if self.show_mixer_panel {
                     self.rebuild_mixer();
                 }
             }
 
-            let dev_btn = egui::Button::new("⚙ Devices").fill(if self.show_device_panel {
-                egui::Color32::from_rgb(35, 115, 210)
-            } else {
-                egui::Color32::from_gray(58)
-            });
-            if ui.add(dev_btn).clicked() {
+            if ui
+                .add(ToggleButton::new("Devices", self.show_device_panel).theme(&self.theme))
+                .clicked()
+            {
                 self.show_device_panel = !self.show_device_panel;
             }
 
             ui.separator();
 
             // ── Transport controls ────────────────────────────────────────────
-            if ui.button("⏮").on_hover_text("Return to Bar 1").clicked() {
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| {
+                            let c = rect.center();
+                            let r = rect.width().min(rect.height()) * 0.24;
+                            let painter = ui.painter();
+                            painter.line_segment(
+                                [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x - r, c.y + r)],
+                                egui::Stroke::new(1.8, col),
+                            );
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(c.x + r, c.y - r),
+                                    egui::pos2(c.x + r, c.y + r),
+                                    egui::pos2(c.x - r * 0.4, c.y),
+                                ],
+                                col,
+                                egui::Stroke::NONE,
+                            ));
+                        },
+                        TransportVariant::Generic,
+                    )
+                    .size(28.0)
+                    .theme(&self.theme),
+                )
+                .on_hover_text("Return to Bar 1")
+                .clicked()
+            {
                 self.engine_handle.seek(0);
             }
 
             let transport_state = self.engine_handle.telemetry.transport_state();
-            let play_label = if transport_state == 1 { "⏸" } else { "▶" };
-            let play_btn = egui::Button::new(play_label).fill(if transport_state == 1 {
-                egui::Color32::from_rgb(45, 150, 75)
-            } else {
-                egui::Color32::from_gray(62)
-            });
-            if ui.add(play_btn).clicked() {
+            let is_playing = transport_state == 1;
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| {
+                            if is_playing {
+                                let c = rect.center();
+                                let w = 3.0;
+                                let h = 10.0;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(c.x - 3.0, c.y),
+                                        egui::vec2(w, h),
+                                    ),
+                                    1.0,
+                                    col,
+                                );
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(c.x + 3.0, c.y),
+                                        egui::vec2(w, h),
+                                    ),
+                                    1.0,
+                                    col,
+                                );
+                            } else {
+                                Icon::paint(ui.painter(), rect, IconKind::Play, col);
+                            }
+                        },
+                        TransportVariant::Play,
+                    )
+                    .size(28.0)
+                    .active(is_playing)
+                    .theme(&self.theme),
+                )
+                .clicked()
+            {
                 self.engine_handle.toggle_play();
             }
 
-            if ui.button("⏹").on_hover_text("Stop").clicked() {
+            if ui
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Stop, col),
+                        TransportVariant::Stop,
+                    )
+                    .size(28.0)
+                    .theme(&self.theme),
+                )
+                .on_hover_text("Stop")
+                .clicked()
+            {
                 if matches!(self.recorder.status(), RecordingStatus::Recording { .. }) {
                     self.toggle_recording();
                 } else if self.midi_recorder.is_recording() {
@@ -1418,13 +1489,16 @@ impl EsperiaApp {
 
             let is_recording = matches!(self.recorder.status(), RecordingStatus::Recording { .. })
                 || self.midi_recorder.is_recording();
-            let rec_btn = egui::Button::new("⏺").fill(if is_recording {
-                egui::Color32::from_rgb(205, 45, 45)
-            } else {
-                egui::Color32::from_gray(62)
-            });
             if ui
-                .add(rec_btn)
+                .add(
+                    TransportButton::new(
+                        |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Record, col),
+                        TransportVariant::Record,
+                    )
+                    .size(28.0)
+                    .active(is_recording)
+                    .theme(&self.theme),
+                )
                 .on_hover_text("Record MIDI (when MIDI track selected) or Audio")
                 .clicked()
             {
@@ -1437,12 +1511,11 @@ impl EsperiaApp {
                 }
             }
 
-            let loop_btn = egui::Button::new("⟳").fill(if self.loop_enabled {
-                egui::Color32::from_rgb(205, 155, 35)
-            } else {
-                egui::Color32::from_gray(62)
-            });
-            if ui.add(loop_btn).on_hover_text("Cycle / Loop").clicked() {
+            if ui
+                .add(ToggleButton::new("Loop", self.loop_enabled).theme(&self.theme))
+                .on_hover_text("Cycle / Loop")
+                .clicked()
+            {
                 self.loop_enabled = !self.loop_enabled;
                 self.engine_handle.enable_loop(self.loop_enabled);
                 if self.loop_enabled {
