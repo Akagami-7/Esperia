@@ -203,34 +203,8 @@ mod lab_content {
             ui.add_space(theme.metrics.spacing.md);
 
             let pill_resp = PillButton::new(
-                |ui, rect, col| {
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "123",
-                        egui::FontId::proportional(11.0),
-                        col,
-                    );
-                },
-                |ui, rect, col| {
-                    let c = rect.center();
-                    let stroke = egui::Stroke::new(1.5, col);
-                    ui.painter().line_segment(
-                        [egui::pos2(c.x - 6.0, c.y + 7.0), egui::pos2(c.x, c.y - 7.0)],
-                        stroke,
-                    );
-                    ui.painter().line_segment(
-                        [egui::pos2(c.x, c.y - 7.0), egui::pos2(c.x + 6.0, c.y + 7.0)],
-                        stroke,
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(c.x - 4.0, c.y + 7.0),
-                            egui::pos2(c.x + 4.0, c.y + 7.0),
-                        ],
-                        stroke,
-                    );
-                },
+                |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::CountIn, col),
+                |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Metronome, col),
             )
             .theme(theme)
             .active_a(state.count_in)

@@ -83,7 +83,6 @@ where
         let default_theme = Theme::default();
         let theme = self.theme.unwrap_or(&default_theme);
         let p = &theme.palette;
-        let m = &theme.metrics;
 
         let total_width = self.slot_width * 2.0 + self.gap;
         let desired_size = Vec2::new(total_width, self.height);
@@ -110,8 +109,8 @@ where
             if any_hovered {
                 ui.painter().rect_filled(
                     container_rect,
-                    CornerRadius::same(m.radii.window as u8),
-                    p.panel_raised,
+                    CornerRadius::same(14),
+                    Color32::from_rgba_unmultiplied(128, 128, 128, 36),
                 );
             }
 
@@ -134,51 +133,96 @@ where
 }
 
 fn render_slot(ui: &mut Ui, rect: Rect, theme: &Theme, state: ButtonState) {
-    let p = &theme.palette;
-    let radius = theme.metrics.radii.window;
-    let rounding = CornerRadius::same(radius as u8);
     let painter = ui.painter();
+    let radius = theme.metrics.radii.window;
+    let rounding = CornerRadius::same(14);
 
     let scale = state.press_scale();
+
+    // HTML: translateY(1.5px) scale(0.94)
     let draw_rect = if (scale - 1.0).abs() > f32::EPSILON {
-        Rect::from_center_size(rect.center(), rect.size() * scale)
+        Rect::from_center_size(rect.center() + Vec2::new(0.0, 1.5), rect.size() * scale)
     } else {
         rect
     };
 
-    if matches!(state, ButtonState::Active) {
+    let active = matches!(state, ButtonState::Active);
+    let pressed = matches!(state, ButtonState::Pressed);
+    let hovered = matches!(state, ButtonState::Hovered);
+
+    if active {
+        // Purple external shadow.
         shadow(painter, draw_rect, radius, Shadow::control(theme));
-    }
 
-    let fill = match state {
-        ButtonState::Active => p.accent_active,
-        ButtonState::Pressed => p.control_pressed,
-        _ => Color32::TRANSPARENT,
-    };
-    painter.rect_filled(draw_rect, rounding, fill);
+        // Active purple background.
+        painter.rect_filled(draw_rect, rounding, Color32::from_rgb(115, 37, 155));
 
-    if matches!(state, ButtonState::Active) {
+        // Top gradient-like highlight.
+        let highlight_rect =
+            Rect::from_min_max(draw_rect.min, pos2(draw_rect.right(), draw_rect.center().y));
+
+        painter.rect_filled(
+            highlight_rect,
+            CornerRadius {
+                nw: 14,
+                ne: 14,
+                sw: 0,
+                se: 0,
+            },
+            Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+        );
+
+        // Inset top highlight.
         painter.line_segment(
             [
-                pos2(draw_rect.left() + radius, draw_rect.top() + 0.5),
-                pos2(draw_rect.right() - radius, draw_rect.top() + 0.5),
+                pos2(draw_rect.left() + 9.0, draw_rect.top() + 1.0),
+                pos2(draw_rect.right() - 9.0, draw_rect.top() + 1.0),
             ],
-            Stroke::new(1.0, Color32::from_white_alpha(64)),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 82)),
         );
+
+        // Bottom inset shadow.
+        painter.line_segment(
+            [
+                pos2(draw_rect.left() + 9.0, draw_rect.bottom() - 1.5),
+                pos2(draw_rect.right() - 9.0, draw_rect.bottom() - 1.5),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(32, 7, 46, 85)),
+        );
+    } else if pressed {
+        // Tactile inward press.
+        painter.rect_filled(
+            draw_rect,
+            rounding,
+            Color32::from_rgba_unmultiplied(128, 128, 128, 28),
+        );
+
         painter.rect_stroke(
             draw_rect,
             rounding,
-            Stroke::new(1.0, p.accent),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 55)),
             StrokeKind::Inside,
+        );
+    } else if hovered {
+        // Translucent individual hover.
+        painter.rect_filled(
+            draw_rect,
+            rounding,
+            Color32::from_rgba_unmultiplied(128, 128, 128, 26),
         );
     }
 }
 
 fn slot_icon_color(p: &crate::theme::Palette, state: ButtonState) -> Color32 {
     match state {
-        ButtonState::Active | ButtonState::Pressed => p.text_primary,
-        ButtonState::Hovered => p.text_primary,
+        ButtonState::Active => Color32::from_rgb(245, 232, 255),
+
+        ButtonState::Pressed => p.text_primary,
+
+        ButtonState::Hovered => Color32::from_rgb(81, 81, 81),
+
         ButtonState::Disabled => p.text_muted,
-        _ => p.text_secondary,
+
+        _ => Color32::from_rgb(81, 81, 81),
     }
 }

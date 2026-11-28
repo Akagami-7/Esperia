@@ -37,7 +37,7 @@ use esperia_recording::{
 };
 use esperia_ui::{
     Theme,
-    components::{ToggleButton, TransportButton, TransportVariant, VolumeGlider},
+    components::{PillButton, ToggleButton, TransportButton, TransportVariant, VolumeGlider},
     primitives::{Icon, IconKind},
 };
 use std::collections::HashMap;
@@ -194,6 +194,8 @@ struct EsperiaApp {
     midi_drag_state: Option<MidiClipDragState>,
     scrubbing_playhead: bool,
     loop_enabled: bool,
+    count_in_enabled: bool,
+    metronome_enabled: bool,
     loop_start_frame: u64,
     loop_end_frame: u64,
 }
@@ -479,6 +481,8 @@ impl EsperiaApp {
             midi_drag_state: None,
             scrubbing_playhead: false,
             loop_enabled: false,
+            count_in_enabled: false,
+            metronome_enabled: false,
             loop_start_frame: 0,
             loop_end_frame: (active_sr as u64) * 4,
         };
@@ -1522,6 +1526,23 @@ impl EsperiaApp {
                     self.engine_handle
                         .set_loop_region(self.loop_start_frame, self.loop_end_frame);
                 }
+            }
+
+            let pill_resp = PillButton::new(
+                |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::CountIn, col),
+                |ui, rect, col| Icon::paint(ui.painter(), rect, IconKind::Metronome, col),
+            )
+            .slot_width(34.0)
+            .height(28.0)
+            .theme(&self.theme)
+            .active_a(self.count_in_enabled)
+            .active_b(self.metronome_enabled)
+            .show(ui);
+            if pill_resp.clicked_a {
+                self.count_in_enabled = !self.count_in_enabled;
+            }
+            if pill_resp.clicked_b {
+                self.metronome_enabled = !self.metronome_enabled;
             }
 
             ui.separator();
